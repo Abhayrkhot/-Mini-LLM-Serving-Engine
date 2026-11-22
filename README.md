@@ -1,123 +1,206 @@
-# Mini LLM Serving Engine
+# minillm: a small LLM serving engine
 
-## Overview
+A from-scratch inference server for decoder-only LLMs (Llama 2/3, Mistral, Qwen2/2.5, Qwen3) in about 2,800 lines of Python:
 
-This project implements a **mini LLM serving engine simulator** using
-plain Python and `asyncio`.  It models the key components of a real
-inference server—request queuing, a concurrency‑limited scheduler and
-token‑level decoding—without relying on any external web framework.
+- a paged KV cache with reference-counted blocks
+- continuous batching with chunked prefill
+- preemption by recompute
+- prefix caching
+- an OpenAI-compatible streaming API with Prometheus metrics
 
-In production, LLM serving systems such as vLLM, TensorRT‑LLM and
-SGLang accept streams of generation requests, schedule them onto
-available GPU capacity and return tokens as soon as they are generated.
-At their core, these systems perform three tasks:
+It loads Hugging Face safetensors checkpoints directly and implements the model itself. `transformers` is used only for tokenizers and as the reference in tests.
 
-1. **Queue requests.**  Incoming prompts are queued until resources are
-   available.  Real servers often process hundreds or thousands of
-   concurrent requests.
-2. **Schedule decoding.**  A scheduler selects which requests can be
-   decoded in parallel based on GPU memory constraints and latency
-   budgets.  The model generates one token at a time for all active
-   requests.
-3. **Stream tokens.**  Tokens are sent back to the caller as soon as
-   they are produced to minimise latency.
+## Status
 
-The `InferenceEngine` class in this project provides a simplified version
-of these steps.  It uses an `asyncio.Semaphore` to limit the number of
-concurrent decode tasks (mimicking a GPU with limited capacity) and
-emits one token at a time with a configurable delay to simulate
-generation latency.  When all tokens have been produced, a final JSON
-summary is yielded with timing information.  This design helps you
-understand how queuing, scheduling and streaming interact without
-needing a GPU or external dependencies.
+| | |
+|---|---|
+| **Verified** | 84 tests pass on CPU (10 more skip without a GPU or a downloaded model). Greedy output matches Hugging Face token for token on Qwen2, Qwen3 and Llama 3 (with RoPE scaling), through batching, chunked prefill, preemption and prefix-cache hits. On a real checkpoint (Qwen2.5-0.5B-Instruct), all 288 of 288 generated tokens are HF's argmax, on both CPU and Apple MPS. The server is tested over real HTTP: streaming, stop strings, client disconnects, backpressure and engine crashes. |
+| **Written, not yet run** | The CUDA path: the flash-attn paged kernels and GPU memory profiling. `tests/test_gpu.py` and `scripts/gpu_validate.sh` cover it, but no CUDA machine has run them yet. |
+| **Not built yet** | CUDA graphs, speculative decoding, quantized weights, multi-GPU (see the roadmap below). |
 
-## Why this matters
+There are no GPU performance numbers yet. The only measurements so far are from a MacBook (see [Benchmarks](#benchmarks)).
 
-Inference engineering roles require understanding more than just how to
-call an API.  Engineers must design systems that can accept many
-concurrent requests, optimise throughput under GPU memory constraints,
-respect latency service‑level agreements (SLAs) and stream responses
-incrementally.  Building a toy serving engine gives hands‑on experience
-with these constraints and vocabulary: request queues, schedulers,
-prefill versus decode, concurrency limits and streaming responses.  A
-simple simulator like this lets you observe how changing the concurrency
-limit or decode delay affects throughput and latency, which is
-fundamental to designing scalable inference backends.
-
-## Features
-
-* **Concurrency‑limited decoding.**  The `InferenceEngine` uses an
-  `asyncio.Semaphore` to limit the number of concurrent decode tasks.
-  This models a GPU with limited capacity: if the semaphore is set to
-  `2`, only two requests will be decoded at the same time, while others
-  wait in the queue.
-* **Token streaming.**  Tokens are yielded one by one with a
-  configurable delay to simulate model decoding latency.  After the
-  last token, a JSON summary containing the request ID, start/end
-  timestamps and duration is emitted.
-* **Metrics tracking.**  The engine collects simple per‑request metrics
-  such as start time, end time, number of tokens and duration.  These
-  can be inspected via the `metrics` property after a batch of
-  requests completes.
-* **Demonstration CLI.**  Running the module directly executes a demo
-  that submits a few concurrent requests, prints each streamed token and
-  prints the collected metrics.  This helps you see how concurrent
-  requests interleave and how the semaphore affects throughput.
-* **Test suite** using `pytest` and `asyncio` to validate that the
-  engine streams tokens correctly and enforces the concurrency limit.
-
-## Project structure
+## Architecture
 
 ```text
-03-mini-llm-serving-engine/
-├── server.py         # Defines the InferenceEngine and demo CLI
-├── tests/
-│   └── test_server.py
-├── requirements.txt
-└── README.md
+ HTTP clients ──► FastAPI (asyncio)                         engine thread
+                  /v1/completions                     ┌───────────────────────────┐
+                  /v1/chat/completions   add / abort  │ LLMEngine.step()          │
+                  tokenize, detokenize ─────────────► │  Scheduler                │
+                  stop strings, SSE      queue        │   ├ token budget          │
+                  admission control                   │   ├ chunked prefill       │
+                  /metrics, /health  ◄─────────────── │   └ preemption            │
+                                      per-step tokens │  BlockManager             │
+                                                      │   ├ paged KV blocks       │
+                                                      │   └ prefix cache (LRU)    │
+                                                      │  ModelRunner              │
+                                                      │   ├ CausalLM (own impl)   │
+                                                      │   ├ paged attention       │
+                                                      │   └ sampler               │
+                                                      └───────────────────────────┘
 ```
 
-## Installation
+**One kind of step.** The engine never distinguishes "prefill" from "decode". Each sequence has `num_tokens` (prompt plus generated tokens), and the first `num_computed_tokens` of them already have their K/V in the cache. A step computes some of the remaining tokens. When a sequence catches up, the model samples its next token. All of these are the same operation with different counts, so they can share one batch:
 
-Create a virtual environment and install dependencies:
+- a fresh prompt
+- a 300-token chunk of a long prompt
+- a single decode token
+- recomputing a sequence after preemption
+
+**Scheduling** ([scheduler.py](minillm/scheduler.py)). Each step has a token budget, and running sequences get it first, oldest first.
+
+- *Chunked prefill:* a long prompt is split across steps, so it never stalls the requests that are already decoding.
+- *Preemption:* when the KV cache runs out, the newest running sequence is preempted. Its blocks are freed and it goes back to the front of the queue. Its finished blocks usually survive in the prefix cache, so recomputing it is often cheap.
+- *Admission:* new requests are admitted only on steps with no preemption, and only while a small reserve of free blocks remains.
+
+**Memory** ([block_manager.py](minillm/block_manager.py)). The KV cache is a pool of fixed-size blocks.
+
+- *Block tables:* a sequence's table maps its token positions to physical blocks, so memory grows one block at a time.
+- *Prefix-cache keys:* a full block is registered under a hash chained from every block before it, so a hit on block *i* means the whole prefix up to *i* matches. Each hit is also checked against the block's stored token ids.
+- *Eviction:* blocks are reference counted. A freed block keeps its hash and can be revived until memory is needed. Eviction is LRU, and blocks with no cached content go first.
+
+**Attention** ([attention.py](minillm/layers/attention.py)). Every step's tokens are packed into one flat batch with no padding. Two backends:
+
+- `torch`: gathers each sequence's blocks and runs SDPA with an explicit mask. It runs on CPU, MPS and CUDA, and the tests check it against dense attention.
+- `flash_attn`: uses flash-attn's varlen and kv-cache kernels, which read the block table directly. CUDA only.
+
+## Quickstart
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+pip install -e '.[dev]'            # on CUDA, also: pip install flash-attn --no-build-isolation
+minillm-serve --model Qwen/Qwen2.5-0.5B-Instruct --port 8000
 ```
-
-## Running the demo
-
-You can run the demonstration CLI to see how the engine behaves under
-concurrent load.  Execute the module directly:
 
 ```bash
-python server.py
+curl localhost:8000/v1/chat/completions -H 'content-type: application/json' \
+  -d '{"messages": [{"role": "user", "content": "Hello!"}], "max_tokens": 64, "stream": true}'
 ```
 
-The script will submit three concurrent requests and print each token
-as it is generated.  At the end, it prints a list of per‑request
-metrics.  You can modify the prompts, number of tokens or the
-`max_active` and `decode_delay` parameters in the code to experiment
-with different concurrency limits and latencies.
+Any OpenAI client works against `http://localhost:8000/v1`. Offline use:
 
-## Running the tests
+```python
+from minillm import EngineConfig, LLMEngine, SamplingParams
 
-Run the unit tests with `pytest`:
+engine = LLMEngine(EngineConfig(model="Qwen/Qwen2.5-0.5B-Instruct"))
+for r in engine.generate(
+    ["The capital of France is"], SamplingParams(max_tokens=16, temperature=0)
+):
+    print(r.text, r.finish_reason, f"ttft={r.time_to_first_token:.3f}s")
+```
+
+### Server behaviour
+
+| | |
+|---|---|
+| Endpoints | `/v1/completions` (text or token-id prompts), `/v1/chat/completions` (uses the model's chat template), `/v1/models`, `/health`, `/metrics` |
+| Sampling | temperature, top-p, top-k, `stop` strings (never included in output, held back while streaming), `stop_token_ids`, `ignore_eos`, `stream_options.include_usage`, cached-token counts in `usage` |
+| Backpressure | over `--max-pending-requests` in flight → `429` with `Retry-After` |
+| Validation | prompt + `max_tokens` over the context limit → `400` with the OpenAI error shape. Unsupported options (`n > 1`, `logprobs`, `seed`) also get a `400` instead of being silently ignored. |
+| Cancellation | a client that disconnects, streaming or not, aborts its request and frees its KV blocks |
+| Failure | if the engine thread dies, in-flight and new requests fail fast and `/health` returns `503` |
+| Shutdown | stops accepting connections, drains in-flight requests (30 s), then stops the engine |
+
+### Metrics
+
+Prometheus series (all prefixed `minillm_`):
+
+- latency histograms:
+  - `time_to_first_token_seconds`
+  - `inter_token_latency_seconds`
+  - `e2e_request_latency_seconds`
+  - `request_queue_time_seconds`
+  - `step_duration_seconds`
+- throughput:
+  - `step_tokens`
+  - `prompt_tokens_total`
+  - `generation_tokens_total`
+- requests:
+  - `requests_finished_total{finish_reason}`
+  - `requests_rejected_total{reason}`
+- cache and memory:
+  - `preemptions_total`
+  - `prefix_cache_queries_total`
+  - `prefix_cache_hits_total`
+  - `kv_cache_usage_ratio`
+- queue depth:
+  - `num_requests_running`
+  - `num_requests_waiting`
+
+TTFT counts from arrival, so queueing time is included.
+
+## Testing
 
 ```bash
-pytest -q
+pytest -q                                   # 84 tests, ~13 s on a laptop CPU, no downloads
+MINILLM_TEST_MODEL=Qwen/Qwen2.5-0.5B-Instruct pytest -m slow   # real-checkpoint parity
 ```
 
-The tests exercise the `InferenceEngine` directly.  They verify that
-tokens are streamed in order and that the concurrency limit enforces
-serialisation when the semaphore size is set to one.  This ensures that
-the simulator correctly models request queuing and scheduling.
+| Test file | What it proves |
+|---|---|
+| `test_model_parity.py` | The engine's greedy output equals Hugging Face's on randomly initialised Qwen2, Qwen3 and Llama 3 checkpoints. This holds under batching, chunked prefill (7-token budget), preemption (18-block cache) and prefix-cache hits, and also when the KV pool is pre-filled with NaN, so stale memory can never leak into another request. |
+| `test_attention.py` | Paged attention equals dense causal attention, for blocks in shuffled order, grouped-query heads, decodes, full prompts and chunks on cached context. |
+| `test_block_manager.py` | A Hypothesis state machine tracks the physical contents of every block. After any sequence of admit, decode and free operations, every computed token of every live sequence is still in place and reference counts match the tables. A deliberately broken allocator fails this test (mutation-checked). |
+| `test_scheduler.py` | Token budget, chunk sizes, decodes never starved by long prompts, `max_num_seqs`, preemption preserving outputs, resume order, stop conditions, abort freeing blocks, prefix-cache accounting |
+| `test_server.py` | Real uvicorn over HTTP: SSE format, usage, chat template, stop strings, 400/429 responses, 32 concurrent clients, aborts on streaming and non-streaming disconnect |
+| `test_async_engine.py` | Streamed output equals offline output. Closing a stream aborts its request. An executor crash fails in-flight and new requests. |
+| `test_gpu.py` | The flash-attn backend agrees with the torch backend (CUDA only) |
+| `test_real_model.py` | On a real checkpoint, every generated token is HF's argmax. Teacher forcing is used so that one float near-tie can't send the comparison down a different continuation. |
 
-## Resume bullet
+The scheduler, server and async tests run on `FakeExecutor`, a deterministic stand-in for the GPU. Its next token depends only on the sequence's own tokens, so outputs must be identical however requests are batched, chunked or preempted. That's the same property the real engine needs.
 
-Built a mini LLM serving engine simulator using `asyncio`, featuring a
-request queue, semaphore‑controlled concurrency limit, token streaming
-and per‑request metrics, with a CLI demonstration and `pytest` tests to
-validate queuing and throughput behaviour.
+## Benchmarks
+
+Both harnesses send token-id prompts, so every engine sees byte-identical input:
+
+- `benchmarks/bench_offline.py`: minillm, HF `generate` and vLLM, with identical prompts and per-request output lengths.
+- `benchmarks/bench_serving.py`: a Poisson-arrival streaming load generator for any OpenAI-compatible server. It reports TTFT, TPOT, ITL and end-to-end latency (p50/p90/p99), throughput, and goodput under SLOs.
+
+`scripts/gpu_validate.sh` does the full CUDA run and writes `REPORT.md` via `scripts/report.py`:
+
+1. runs the test suite, including the GPU and real-model tests
+2. runs the offline comparison on uniform and variable-length workloads
+3. sweeps request rates against minillm and then vLLM with the same limits
+4. runs a shared-system-prompt workload against both
+
+`benchmarks/fake_server.py` serves the full HTTP stack over the fake executor with a latency cost model. CI uses it to load-test the server with no GPU.
+
+### Dev-machine numbers (Apple M4, MPS, bfloat16)
+
+These come from a MacBook, not a GPU server, so treat them as a sanity check. The gap they show is the reason for the CUDA work above.
+
+Qwen2.5-0.5B-Instruct, 64 requests, about 256 tokens in and 128 out. HF runs static batches of 32. Throughput counts only the tokens each request asked for.
+
+| workload | minillm | HF `generate` |
+|---|---:|---:|
+| uniform lengths (static batching's best case) | 197 tok/s | 264 tok/s |
+| lengths vary ±90% (prompts and outputs) | 142 tok/s | 139 tok/s |
+
+How to read this:
+
+- **Variable lengths:** continuous batching recovers what static batching loses to padding and stragglers, and the two engines tie.
+- **Uniform lengths:** HF wins. My torch attention backend gathers each sequence's whole context out of the paged cache on every layer and every step. HF reads a contiguous cache. This is the cost a paged attention kernel removes; on CUDA that kernel is flash-attn's.
+- **What didn't help:** switching to SDPA's native GQA instead of copying K/V for every query head gave +17%. Bucketing shapes for MPS kernel reuse and removing the NaN guard made no measurable difference, so neither change was kept.
+
+## Layout
+
+```text
+minillm/
+  scheduler.py, block_manager.py, sequence.py, sampling.py   scheduling and memory (no torch)
+  engine.py, async_engine.py, metrics.py, tokenizer.py       engine loop, streaming, metrics
+  executor/model_runner.py   batch tensors, KV-cache sizing and allocation, sampling
+  executor/fake.py           deterministic executor and byte tokenizer for tests and CI
+  models/llama.py, loader.py model implementation, safetensors loading
+  layers/attention.py, sampler.py
+  entrypoints/openai_server.py, protocol.py
+benchmarks/  bench_offline.py, bench_serving.py, fake_server.py
+scripts/     gpu_validate.sh, report.py
+tests/
+```
+
+## Roadmap
+
+1. **CUDA validation and numbers.** Run `scripts/gpu_validate.sh` on an A100 or H200 and publish the report: offline and online throughput versus HF and vLLM, latency under load, and prefix-cache effect.
+2. **CUDA graphs for decode.** Capture decode steps at a set of batch sizes, padding each batch up to the nearest one. At small batch sizes, kernel launch overhead dominates decode time.
+3. **Engine core in its own process.** The scheduler and the HTTP layer currently share one Python process, so they compete for the GIL. Moving the engine behind a ZeroMQ socket removes that contention.
+4. **Speculative decoding** (n-gram / prompt lookup first) and **4-bit weights**, using the W4A16 Triton kernel from Quantized-inference-lab.
+5. **Container image** built and smoke-tested in CI on a GPU runner.

@@ -1,0 +1,50 @@
+"""Engine configuration."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+
+@dataclass
+class EngineConfig:
+    model: str
+    """Local directory or Hugging Face Hub id of a safetensors checkpoint."""
+    tokenizer: str | None = None
+    """Tokenizer location; defaults to ``model``."""
+
+    device: str = "auto"
+    """``auto`` picks cuda, then mps, then cpu."""
+    dtype: str = "auto"
+    """``auto``: bfloat16 on cuda/mps, float32 on cpu. Or float16, bfloat16, float32."""
+    attention_backend: str = "auto"
+    """``auto`` uses flash_attn on CUDA when installed, otherwise the torch backend."""
+
+    block_size: int | None = None
+    """Tokens per KV block. Default 256 for flash_attn (its paged kernels require it), else 16."""
+    max_model_len: int | None = None
+    """Longest prompt + output. Default: the model's limit, lowered to what the KV cache holds."""
+    max_num_seqs: int = 128
+    """Most sequences running at once."""
+    max_num_batched_tokens: int = 2048
+    """Token budget per engine step, shared between prompt chunks and decodes."""
+    enable_chunked_prefill: bool = True
+    enable_prefix_caching: bool = True
+
+    gpu_memory_utilization: float = 0.90
+    """CUDA only: fraction of device memory the engine may use, weights and KV cache included."""
+    kv_cache_memory_gb: float = 1.0
+    """CPU/MPS only: memory reserved for the KV cache."""
+    num_kv_blocks: int | None = None
+    """Override the KV-cache size in blocks (skips memory profiling)."""
+
+    seed: int = 0
+
+    def __post_init__(self) -> None:
+        if not 0 < self.gpu_memory_utilization <= 1:
+            raise ValueError("gpu_memory_utilization must be in (0, 1]")
+        if self.max_num_seqs < 1 or self.max_num_batched_tokens < 1:
+            raise ValueError("max_num_seqs and max_num_batched_tokens must be >= 1")
+        if self.block_size is not None and self.block_size < 1:
+            raise ValueError("block_size must be >= 1")
+        if self.attention_backend not in ("auto", "torch", "flash_attn"):
+            raise ValueError("attention_backend must be auto, torch or flash_attn")
