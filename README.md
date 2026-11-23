@@ -303,3 +303,7 @@ tests/
 2. **CUDA graphs for mixed steps.** Steps that contain prompt chunks still run eagerly, which is part of why the variable-length workload trails vLLM by more than the uniform one. vLLM captures everything except attention ("piecewise" graphs).
 3. **Speculative decoding** (n-gram / prompt lookup first) and **4-bit weights**, using the W4A16 Triton kernel from Quantized-inference-lab.
 4. **Container image** built and smoke-tested in CI on a GPU runner.
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE).
