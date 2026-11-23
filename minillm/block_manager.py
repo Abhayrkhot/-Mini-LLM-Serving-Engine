@@ -176,6 +176,15 @@ class BlockManager:
         seq.block_hashes.clear()
         seq.num_computed_tokens = 0
 
+    def reset_prefix_cache(self) -> None:
+        """Forget every cached block that no running sequence holds (benchmarks, admin)."""
+        for block_id in list(self._free):
+            block = self.blocks[block_id]
+            if block.hash is not None:
+                self._cached.pop(block.hash, None)
+                block.hash = None
+                block.token_ids = None
+
     def cache_full_blocks(self, seq: Sequence) -> None:
         """Register blocks of ``seq`` that became full of computed K/V this step."""
         if not self.enable_prefix_caching:

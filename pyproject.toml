@@ -20,7 +20,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-cuda = ["flash-attn>=2.6"]
+# Paged attention kernels for CUDA. FlashInfer is the tested backend (H200, torch 2.14);
+# flash-attn's prebuilt wheels only cover torch <= 2.9.
+cuda = ["flashinfer-python>=0.2"]
+flash-attn = ["flash-attn>=2.6"]
 bench = ["httpx>=0.27", "numpy>=1.26"]
 dev = [
     "pytest>=8",

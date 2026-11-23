@@ -17,9 +17,9 @@ from minillm.block_manager import BlockManager
 from minillm.executor.model_runner import ModelRunner
 from minillm.scheduler import ScheduledSeq
 from minillm.sequence import Sequence
-from tests.conftest import hf_greedy
+from tests.conftest import TINY_MODEL_NAMES, hf_greedy
 
-MODELS = ["qwen2", "qwen3", "llama3"]
+MODELS = TINY_MODEL_NAMES
 GREEDY = SamplingParams(max_tokens=20, temperature=0.0, ignore_eos=True)
 
 

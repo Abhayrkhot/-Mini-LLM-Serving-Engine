@@ -35,6 +35,9 @@ class PagedBatch:
     meta: AttentionMetadata
     reference: torch.Tensor
     scale: float
+    tables: list[list[int]]
+    q_lens: list[int]
+    k_lens: list[int]
 
 
 def random_paged_batch(
@@ -107,7 +110,17 @@ def random_paged_batch(
         decode_only=max(q_lens) == 1,
     )
     return PagedBatch(
-        torch.cat(qs), torch.cat(ks), torch.cat(vs), k_cache, v_cache, meta, torch.cat(refs), scale
+        torch.cat(qs),
+        torch.cat(ks),
+        torch.cat(vs),
+        k_cache,
+        v_cache,
+        meta,
+        torch.cat(refs),
+        scale,
+        tables,
+        q_lens,
+        k_lens,
     )
 
 
