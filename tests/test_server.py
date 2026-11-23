@@ -1,4 +1,8 @@
-"""The OpenAI-compatible server, run for real (uvicorn on a local port) over the fake executor."""
+"""The OpenAI-compatible server, run for real (uvicorn on a local port) over the fake executor.
+
+Every test runs twice: with the engine on a thread in the server process, and
+with the engine in its own process (the server's default).
+"""
 
 from __future__ import annotations
 
@@ -14,9 +18,10 @@ import httpx
 import pytest
 import uvicorn
 
-from minillm import AsyncLLMEngine, EngineConfig, LLMEngine
+from minillm import AsyncLLMEngine, EngineConfig, EngineCoreClient, EngineSpec, LLMEngine
+from minillm.async_engine import EngineClient
 from minillm.entrypoints.openai_server import build_app
-from minillm.executor.fake import FakeExecutor
+from minillm.executor.fake import FakeExecutor, build_fake_engine
 from minillm.metrics import EngineMetrics
 from minillm.sequence import Sequence
 from tests.conftest import CharTokenizer
@@ -37,24 +42,38 @@ def free_port() -> int:
 
 
 class LiveServer:
-    def __init__(self, step_time: float = 0.0, max_pending: int = 64) -> None:
-        executor = FakeExecutor(
-            num_kv_blocks=1024,
-            block_size=16,
-            max_model_len=512,
-            vocab_size=259,
-            eos_token_ids=[1],
-            next_token=text_token,
-            cost_model=(lambda batch: step_time) if step_time else None,
-        )
+    def __init__(
+        self, step_time: float = 0.0, max_pending: int = 64, engine_process: bool = False
+    ) -> None:
         self.metrics = EngineMetrics()
-        self.llm = LLMEngine(
-            EngineConfig(model="fake"),
-            executor=executor,
-            tokenizer=CharTokenizer(),
-            metrics=self.metrics,
-        )
-        self.engine = AsyncLLMEngine(self.llm)
+        self.engine: EngineClient
+        if engine_process:
+            executor_kwargs = dict(num_kv_blocks=1024, block_size=16, max_model_len=512, text=TEXT)
+            client = EngineCoreClient(
+                EngineSpec(
+                    build_fake_engine, dict(executor=executor_kwargs, step_time_s=step_time)
+                ),
+                metrics=self.metrics,
+            )
+            client.launch()
+            self.engine = client
+        else:
+            executor = FakeExecutor(
+                num_kv_blocks=1024,
+                block_size=16,
+                max_model_len=512,
+                vocab_size=259,
+                eos_token_ids=[1],
+                next_token=text_token,
+                cost_model=(lambda batch: step_time) if step_time else None,
+            )
+            llm = LLMEngine(
+                EngineConfig(model="fake"),
+                executor=executor,
+                tokenizer=CharTokenizer(),
+                metrics=self.metrics,
+            )
+            self.engine = AsyncLLMEngine(llm)
         app = build_app(
             self.engine,
             CharTokenizer(),
@@ -87,22 +106,30 @@ class LiveServer:
         return 0.0 if value is None else value
 
     def wait_idle(self, timeout: float = 5.0) -> None:
+        """Wait until the engine itself (not just the server) has nothing in flight."""
         deadline = time.monotonic() + timeout
-        while self.llm.num_unfinished_requests or self.engine.num_active_requests:
+        while (
+            self.engine.num_active_requests
+            or self.metric("minillm_num_requests_running")
+            or self.metric("minillm_num_requests_waiting")
+        ):
             if time.monotonic() > deadline:
                 raise AssertionError("requests still in flight")
             time.sleep(0.02)
 
 
-@pytest.fixture
-def server() -> Iterator[LiveServer]:
-    with LiveServer() as s:
+ENGINE_MODES = ["thread", "process"]
+
+
+@pytest.fixture(params=ENGINE_MODES)
+def server(request: pytest.FixtureRequest) -> Iterator[LiveServer]:
+    with LiveServer(engine_process=request.param == "process") as s:
         yield s
 
 
-@pytest.fixture
-def slow_server() -> Iterator[LiveServer]:
-    with LiveServer(step_time=0.01, max_pending=1) as s:
+@pytest.fixture(params=ENGINE_MODES)
+def slow_server(request: pytest.FixtureRequest) -> Iterator[LiveServer]:
+    with LiveServer(step_time=0.01, max_pending=1, engine_process=request.param == "process") as s:
         yield s
 
 
@@ -243,7 +270,8 @@ async def test_many_concurrent_requests(server: LiveServer) -> None:
 
         texts = await asyncio.gather(*(one(i) for i in range(32)))
     assert texts == ["hello world"] * 32
-    assert server.llm.block_manager.num_free_blocks == server.llm.block_manager.num_blocks
+    server.wait_idle()
+    assert server.metric("minillm_kv_cache_usage_ratio") == 0.0  # every KV block was freed
 
 
 def test_client_disconnect_aborts_streaming_request(slow_server: LiveServer) -> None:
@@ -254,8 +282,7 @@ def test_client_disconnect_aborts_streaming_request(slow_server: LiveServer) -> 
     assert any(line.startswith("data: ") for line in received)
     slow_server.wait_idle(timeout=3)  # 400 tokens at 10 ms/step would take 4 s
     assert slow_server.metric("minillm_requests_finished_total", finish_reason="abort") == 1
-    bm = slow_server.llm.block_manager
-    assert bm.num_free_blocks == bm.num_blocks
+    assert slow_server.metric("minillm_kv_cache_usage_ratio") == 0.0
 
 
 def test_client_disconnect_aborts_non_streaming_request(slow_server: LiveServer) -> None:

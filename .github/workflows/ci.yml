@@ -58,6 +58,6 @@ jobs:
           for i in $(seq 50); do curl -sf localhost:8001/health && break; sleep 0.2; done
           python benchmarks/bench_serving.py --base-url http://localhost:8001 --vocab-size 259 \
             --num-prompts 200 --request-rate 20 --input-len 256 --output-len 64 \
-            --range-ratio 0.5 --output load.json
+            --range-ratio 0.5 --workers 2 --output load.json
           python -c "import json,sys; r=json.load(open('load.json')); sys.exit(r['failed'] != 0)"
           curl -sf localhost:8001/metrics | grep minillm_time_to_first_token_seconds_count

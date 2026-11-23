@@ -16,9 +16,10 @@ import logging
 
 import uvicorn
 
-from minillm import AsyncLLMEngine, EngineConfig, LLMEngine
+from minillm import AsyncLLMEngine, EngineCoreClient, EngineSpec
+from minillm.async_engine import EngineClient
 from minillm.entrypoints.openai_server import build_app
-from minillm.executor.fake import ByteTokenizer, FakeExecutor, linear_cost
+from minillm.executor.fake import ByteTokenizer, build_fake_engine, linear_cost
 from minillm.metrics import EngineMetrics
 
 
@@ -36,28 +37,36 @@ def main() -> None:
     p.add_argument("--no-prefix-caching", dest="prefix", action="store_false")
     p.add_argument("--base-ms", type=float, default=4.0, help="fixed cost per step")
     p.add_argument("--per-token-us", type=float, default=20.0, help="cost per computed token")
+    p.add_argument("--no-engine-process", dest="engine_process", action="store_false")
     args = p.parse_args()
     logging.basicConfig(level="INFO", format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
     tokenizer = ByteTokenizer()
-    executor = FakeExecutor(
+    executor = dict(
         num_kv_blocks=args.num_kv_blocks,
         block_size=args.block_size,
         max_model_len=args.max_model_len,
-        vocab_size=tokenizer.vocab_size,
-        eos_token_ids=[tokenizer.eos_token_id],
         cost_model=linear_cost(base_s=args.base_ms / 1000, per_token_s=args.per_token_us / 1e6),
     )
-    config = EngineConfig(
-        model="fake",
+    config = dict(
         max_num_seqs=args.max_num_seqs,
         max_num_batched_tokens=args.max_num_batched_tokens,
         enable_chunked_prefill=args.chunked,
         enable_prefix_caching=args.prefix,
     )
     metrics = EngineMetrics()
-    engine = LLMEngine(config, executor=executor, tokenizer=tokenizer, metrics=metrics)
-    app = build_app(AsyncLLMEngine(engine), tokenizer, model_name="fake", metrics=metrics)
+    engine: EngineClient
+    if args.engine_process:
+        client = EngineCoreClient(
+            EngineSpec(build_fake_engine, dict(config=config, executor=executor)), metrics=metrics
+        )
+        client.launch()
+        engine = client
+    else:
+        llm = build_fake_engine(config=config, executor=executor)
+        llm.metrics = metrics
+        engine = AsyncLLMEngine(llm)
+    app = build_app(engine, tokenizer, model_name="fake", metrics=metrics)
     uvicorn.run(app, host="127.0.0.1", port=args.port, log_level="warning")
 
 

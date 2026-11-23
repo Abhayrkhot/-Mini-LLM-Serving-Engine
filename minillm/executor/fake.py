@@ -20,21 +20,29 @@ from minillm.sequence import Sequence
 CostModel = Callable[[list[ScheduledSeq]], float]
 
 
-def linear_cost(
-    base_s: float = 0.004, per_token_s: float = 2e-5, per_context_token_s: float = 1e-7
-) -> CostModel:
+class LinearCost:
     """Step time = fixed launch cost + compute per new token + memory reads per context token.
 
     Roughly how a real step behaves: decode-heavy batches are dominated by the
-    fixed cost and KV reads, prefill-heavy batches by per-token compute.
+    fixed cost and KV reads, prefill-heavy batches by per-token compute. A class,
+    not a closure, so it pickles into an engine process.
     """
 
-    def cost(batch: list[ScheduledSeq]) -> float:
+    def __init__(self, base_s: float, per_token_s: float, per_context_token_s: float) -> None:
+        self.base_s = base_s
+        self.per_token_s = per_token_s
+        self.per_context_token_s = per_context_token_s
+
+    def __call__(self, batch: list[ScheduledSeq]) -> float:
         new_tokens = sum(s.num_new_tokens for s in batch)
         context = sum(s.seq.num_computed_tokens + s.num_new_tokens for s in batch)
-        return base_s + per_token_s * new_tokens + per_context_token_s * context
+        return self.base_s + self.per_token_s * new_tokens + self.per_context_token_s * context
 
-    return cost
+
+def linear_cost(
+    base_s: float = 0.004, per_token_s: float = 2e-5, per_context_token_s: float = 1e-7
+) -> CostModel:
+    return LinearCost(base_s, per_token_s, per_context_token_s)
 
 
 def default_next_token(seq: Sequence, vocab_size: int, reserved: int) -> int:
@@ -55,6 +63,8 @@ class FakeExecutor:
         reserved_token_ids: int = 4,
         cost_model: CostModel | None = None,
         next_token: Callable[[Sequence], int] | None = None,
+        text: str | None = None,
+        crash_after_steps: int | None = None,
     ) -> None:
         self.num_kv_blocks = num_kv_blocks
         self.block_size = block_size
@@ -62,6 +72,9 @@ class FakeExecutor:
         self.vocab_size = vocab_size
         self.eos_token_ids = list(eos_token_ids or [])
         self.cost_model = cost_model
+        if text is not None:  # "say" this text on repeat, for the byte tokenizer
+            next_token = _TextTokens(text)
+        self.crash_after_steps = crash_after_steps
         self._next_token = next_token or (
             lambda seq: default_next_token(seq, vocab_size, reserved_token_ids)
         )
@@ -69,6 +82,8 @@ class FakeExecutor:
         self.history: list[list[tuple[str, int, bool]]] = []
 
     def execute(self, scheduled: list[ScheduledSeq]) -> list[int]:
+        if self.crash_after_steps is not None and len(self.history) >= self.crash_after_steps:
+            raise RuntimeError("CUDA error: an illegal memory access was encountered (simulated)")
         self.history.append([(s.seq.request_id, s.num_new_tokens, s.sample) for s in scheduled])
         if self.cost_model is not None:
             time.sleep(self.cost_model(scheduled))
@@ -78,7 +93,8 @@ class FakeExecutor:
 class ByteTokenizer:
     """UTF-8 byte tokenizer to pair with FakeExecutor: id = byte + 3; 0/1/2 are pad/EOS/BOS."""
 
-    eos_token_id = 1
+    EOS = 1
+    eos_token_id: int | None = EOS
     bos_token_id = 2
     vocab_size = 259
 
@@ -97,3 +113,48 @@ class ByteTokenizer:
     ) -> str:
         text = "".join(f"<{m['role']}>{m['content']}\n" for m in conversation)
         return text + ("<assistant>" if add_generation_prompt else "")
+
+
+class _TextTokens:
+    """Next token = the next byte of ``text`` (ByteTokenizer ids). Picklable."""
+
+    def __init__(self, text: str) -> None:
+        self.ids = [b + 3 for b in text.encode()]
+
+    def __call__(self, seq: Sequence) -> int:
+        return self.ids[seq.num_output_tokens % len(self.ids)]
+
+
+def build_fake_engine(
+    config: dict[str, Any] | None = None,
+    executor: dict[str, Any] | None = None,
+    step_time_s: float = 0.0,
+) -> Any:
+    """An LLMEngine over FakeExecutor + ByteTokenizer, buildable inside a child process.
+
+    Module-level so ``EngineSpec(build_fake_engine, {...})`` pickles. ``step_time_s``
+    adds a fixed sleep per step.
+    """
+    from minillm.config import EngineConfig
+    from minillm.engine import LLMEngine
+
+    tokenizer = ByteTokenizer()
+    kwargs: dict[str, Any] = dict(
+        vocab_size=tokenizer.vocab_size, eos_token_ids=[ByteTokenizer.EOS]
+    )
+    kwargs.update(executor or {})
+    if step_time_s:
+        kwargs["cost_model"] = _FixedCost(step_time_s)
+    return LLMEngine(
+        EngineConfig(model="fake", **(config or {})),
+        executor=FakeExecutor(**kwargs),
+        tokenizer=tokenizer,
+    )
+
+
+class _FixedCost:
+    def __init__(self, seconds: float) -> None:
+        self.seconds = seconds
+
+    def __call__(self, batch: list[ScheduledSeq]) -> float:
+        return self.seconds

@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from minillm.block_manager import BlockManager
 from minillm.config import EngineConfig
 from minillm.executor.base import Executor
-from minillm.metrics import EngineMetrics
+from minillm.metrics import EngineMetrics, EngineStats, FinishedRequest
 from minillm.sampling import SamplingParams
 from minillm.scheduler import Scheduler, SchedulerOutput, TokenEvent
 from minillm.sequence import Sequence
@@ -89,7 +89,8 @@ class LLMEngine:
         )
         self._requests: dict[str, Sequence] = {}
         self._ids = itertools.count()
-        self._last_stats = time.monotonic()
+        self._stats = EngineStats()
+        self._last_log = time.monotonic()
         self._window_prompt = 0
         self._window_generated = 0
         self._prefix_seen = (0, 0)
@@ -125,6 +126,7 @@ class LLMEngine:
             return False
         self.scheduler.abort(seq)
         self._record_finished(seq)
+        self._flush_metrics()
         return True
 
     def has_unfinished_requests(self) -> bool:
@@ -139,7 +141,7 @@ class LLMEngine:
     def step(self) -> list[TokenOutput]:
         output = self.scheduler.schedule()
         if output.is_empty:
-            self._update_gauges()
+            self._flush_metrics()
             return []
         prefill_tokens = sum(
             s.num_new_tokens
@@ -169,7 +171,17 @@ class LLMEngine:
                     num_cached_tokens=seq.num_cached_tokens,
                 )
             )
+        self._flush_metrics()
         return results
+
+    def take_stats(self) -> EngineStats:
+        """Cut the stats snapshot accumulated since the last call (and start a new one)."""
+        stats = self._stats
+        stats.num_running = len(self.scheduler.running)
+        stats.num_waiting = len(self.scheduler.waiting)
+        stats.kv_cache_usage = self.block_manager.usage
+        self._stats = EngineStats()
+        return stats
 
     def generate(
         self,
@@ -225,48 +237,48 @@ class LLMEngine:
     ) -> None:
         self._window_prompt += prefill_tokens
         self._window_generated += len(events)
-        m = self.metrics
-        if m is not None:
-            m.step_duration.observe(elapsed)
-            m.step_tokens.observe(output.num_batched_tokens)
-            m.generation_tokens.inc(len(events))
-            if output.preempted:
-                m.preemptions.inc(len(output.preempted))
-            bm = self.block_manager
-            queries, hits = bm.prefix_query_tokens, bm.prefix_hit_tokens
-            m.prefix_cache_queries.inc(queries - self._prefix_seen[0])
-            m.prefix_cache_hits.inc(hits - self._prefix_seen[1])
-            self._prefix_seen = (queries, hits)
-            for ev in events:
-                if ev.inter_token_latency is None:
-                    seq = ev.seq
-                    assert seq.first_token_time is not None
-                    m.time_to_first_token.observe(seq.first_token_time - seq.arrival_time)
-                else:
-                    m.inter_token_latency.observe(ev.inter_token_latency)
-        self._update_gauges()
+        st = self._stats
+        st.step_durations.append(elapsed)
+        st.step_tokens.append(output.num_batched_tokens)
+        st.generation_tokens += len(events)
+        st.preemptions += len(output.preempted)
+        bm = self.block_manager
+        queries, hits = bm.prefix_query_tokens, bm.prefix_hit_tokens
+        st.prefix_cache_queries += queries - self._prefix_seen[0]
+        st.prefix_cache_hits += hits - self._prefix_seen[1]
+        self._prefix_seen = (queries, hits)
+        for ev in events:
+            if ev.inter_token_latency is None:
+                seq = ev.seq
+                assert seq.first_token_time is not None
+                st.time_to_first_token.append(seq.first_token_time - seq.arrival_time)
+            else:
+                st.inter_token_latency.append(ev.inter_token_latency)
         self._maybe_log_stats()
 
     def _record_finished(self, seq: Sequence) -> None:
-        m = self.metrics
-        if m is None or seq.finish_reason is None:
+        if seq.finish_reason is None:
             return
-        m.requests_finished.labels(seq.finish_reason.value).inc()
-        m.prompt_tokens.inc(seq.num_prompt_tokens)
-        if seq.finish_time is not None:
-            m.e2e_latency.observe(seq.finish_time - seq.arrival_time)
-        if seq.first_scheduled_time is not None:
-            m.queue_time.observe(seq.first_scheduled_time - seq.arrival_time)
+        self._stats.finished.append(
+            FinishedRequest(
+                finish_reason=seq.finish_reason.value,
+                prompt_tokens=seq.num_prompt_tokens,
+                e2e_latency=None if seq.finish_time is None else seq.finish_time - seq.arrival_time,
+                queue_time=None
+                if seq.first_scheduled_time is None
+                else seq.first_scheduled_time - seq.arrival_time,
+            )
+        )
 
-    def _update_gauges(self) -> None:
+    def _flush_metrics(self) -> None:
+        """In-process metrics: apply the snapshot now. (An engine process instead
+        leaves it for take_stats() and ships it to the API process.)"""
         if self.metrics is not None:
-            self.metrics.num_running.set(len(self.scheduler.running))
-            self.metrics.num_waiting.set(len(self.scheduler.waiting))
-            self.metrics.kv_cache_usage.set(self.block_manager.usage)
+            self.metrics.record(self.take_stats())
 
     def _maybe_log_stats(self) -> None:
         now = time.monotonic()
-        window = now - self._last_stats
+        window = now - self._last_log
         if window < _STATS_INTERVAL_S:
             return
         bm = self.block_manager
@@ -282,6 +294,6 @@ class LLMEngine:
             100 * hit_rate,
             self.scheduler.num_preemptions,
         )
-        self._last_stats = now
+        self._last_log = now
         self._window_prompt = 0
         self._window_generated = 0

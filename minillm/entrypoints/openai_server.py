@@ -19,13 +19,15 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
-from minillm.async_engine import AsyncLLMEngine, EngineDeadError
+from minillm.async_engine import AsyncLLMEngine, EngineClient, EngineDeadError
 from minillm.config import EngineConfig
 from minillm.engine import LLMEngine
+from minillm.engine_core import EngineCoreClient, EngineSpec, build_engine
 from minillm.entrypoints.protocol import ChatCompletionRequest, CompletionRequest, _SamplingFields
 from minillm.metrics import EngineMetrics
+from minillm.models.loader import resolve_model_path
 from minillm.sampling import SamplingParams
-from minillm.tokenizer import IncrementalDetokenizer, StopStringMatcher, Tokenizer
+from minillm.tokenizer import IncrementalDetokenizer, StopStringMatcher, Tokenizer, load_tokenizer
 
 logger = logging.getLogger("minillm.server")
 
@@ -49,16 +51,15 @@ def _error(
 
 
 def build_app(
-    engine: AsyncLLMEngine,
+    engine: EngineClient,
     tokenizer: Tokenizer,
     *,
     model_name: str,
     max_pending_requests: int = 1024,
     metrics: EngineMetrics | None = None,
 ) -> FastAPI:
-    llm = engine.engine
-    max_model_len = llm.max_model_len
-    vocab_size = llm.executor.vocab_size
+    max_model_len = engine.max_model_len  # an engine process must be launched first
+    vocab_size = engine.vocab_size
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -366,6 +367,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--enforce-eager", action="store_true", help="disable decode CUDA graphs")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--max-pending-requests", type=int, default=1024)
+    p.add_argument(
+        "--no-engine-process",
+        dest="engine_process",
+        action="store_false",
+        help="run the engine on a thread in the API process instead of in its own process",
+    )
     p.add_argument("--log-level", default="info", choices=["debug", "info", "warning", "error"])
     return p.parse_args(argv)
 
@@ -395,12 +402,24 @@ def main(argv: list[str] | None = None) -> None:
         seed=args.seed,
     )
     metrics = EngineMetrics()
-    llm = LLMEngine(config, metrics=metrics)
-    if llm.tokenizer is None:
+    engine: EngineClient
+    if args.engine_process:
+        # The model loads in the engine process; this one only needs the tokenizer.
+        client = EngineCoreClient(
+            EngineSpec(build_engine, {"config": config}), metrics=metrics, log_level=args.log_level
+        )
+        client.launch()
+        engine = client
+        tokenizer = load_tokenizer(config.tokenizer or resolve_model_path(config.model))
+    else:
+        llm = LLMEngine(config, metrics=metrics)
+        engine = AsyncLLMEngine(llm)
+        tokenizer = llm.tokenizer
+    if tokenizer is None:
         raise SystemExit(f"no tokenizer found for {config.tokenizer or config.model}")
     app = build_app(
-        AsyncLLMEngine(llm),
-        llm.tokenizer,
+        engine,
+        tokenizer,
         model_name=args.served_model_name or args.model,
         max_pending_requests=args.max_pending_requests,
         metrics=metrics,
