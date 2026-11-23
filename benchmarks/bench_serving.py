@@ -36,8 +36,12 @@ class RequestRecord:
     chunk_gaps: list[float] = field(default_factory=list)
 
 
-def build_prompts(args: argparse.Namespace, vocab_size: int) -> list[list[int]]:
-    rng = random.Random(args.seed)
+def build_prompts(
+    args: argparse.Namespace, vocab_size: int, seed: int | None = None
+) -> list[list[int]]:
+    """Random token-id prompts. Every run must use its own seed: engines with prefix
+    caching would otherwise serve repeated prompts from cache and look faster."""
+    rng = random.Random(args.seed if seed is None else seed)
     lo, hi = 100, vocab_size - 100  # stay clear of special tokens at both ends
     shared = [rng.randrange(lo, hi) for _ in range(args.prefix_len)]
     prompts = []
@@ -165,8 +169,9 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         rng = random.Random(args.seed + 1)
         sem = asyncio.Semaphore(args.max_concurrency or len(prompts))
 
-        if args.warmup:
-            await asyncio.gather(*(one_request(client, args, p) for p in prompts[: args.warmup]))
+        if args.warmup:  # separate prompts, so the measured ones are not already cached
+            warm = build_prompts(args, vocab_size, seed=args.seed + 1_000_003)[: args.warmup]
+            await asyncio.gather(*(one_request(client, args, p) for p in warm))
 
         async def limited(p: list[int]) -> RequestRecord:
             async with sem:

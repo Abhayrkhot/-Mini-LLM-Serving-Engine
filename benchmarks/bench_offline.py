@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import platform
 import random
@@ -41,6 +42,12 @@ def make_requests(args: argparse.Namespace, vocab_size: int) -> list[tuple[list[
     return requests
 
 
+WARMUP_REQUESTS = (
+    32  # full-length prompts, a few tokens each: exercises real prefill and decode shapes
+)
+WARMUP_TOKENS = 8
+
+
 def _max_len(args: argparse.Namespace) -> int:
     return int((args.input_len + args.output_len) * (1 + args.range_ratio)) + 2
 
@@ -59,12 +66,15 @@ def run_minillm(args: argparse.Namespace) -> tuple[float, int, dict[str, Any]]:
             gpu_memory_utilization=args.gpu_memory_utilization,
             kv_cache_memory_gb=args.kv_cache_memory_gb,
             max_model_len=_max_len(args),
+            enforce_eager=args.enforce_eager,
         )
     )
     requests = make_requests(args, engine.executor.vocab_size)
     prompts = [p for p, _ in requests]
     params = [SamplingParams(max_tokens=n, temperature=0.0, ignore_eos=True) for _, n in requests]
-    engine.generate(prompts[:2], SamplingParams(max_tokens=4, temperature=0.0))  # warm-up
+    warm = SamplingParams(max_tokens=WARMUP_TOKENS, temperature=0.0, ignore_eos=True)
+    engine.generate(prompts[:WARMUP_REQUESTS], warm)
+    engine.block_manager.reset_prefix_cache()  # the timed run must not hit warm-up blocks
     _sync()
     start = time.perf_counter()
     results = engine.generate(prompts, params)
@@ -77,6 +87,7 @@ def run_minillm(args: argparse.Namespace) -> tuple[float, int, dict[str, Any]]:
         "kv_blocks": engine.block_manager.num_blocks,
         "block_size": runner.block_size,
         "attention_backend": getattr(runner, "backend", None),
+        "cuda_graphs": getattr(runner, "graphs", None) is not None,
         "dtype": str(getattr(runner, "dtype", "")),
         "device": str(getattr(runner, "device", "")),
     }
@@ -91,7 +102,11 @@ def run_hf(args: argparse.Namespace) -> tuple[float, int, dict[str, Any]]:
 
     device = resolve_device(args.device)
     dtype = resolve_dtype(args.dtype, device)
-    model = AutoModelForCausalLM.from_pretrained(args.model, dtype=dtype).to(device).eval()
+    import transformers
+
+    # transformers 5 renamed torch_dtype to dtype; older releases ignore the new name.
+    key = "dtype" if int(transformers.__version__.split(".")[0]) >= 5 else "torch_dtype"
+    model = AutoModelForCausalLM.from_pretrained(args.model, **{key: dtype}).to(device).eval()
     requests = make_requests(args, model.config.vocab_size)
     bs = args.hf_batch_size
 
@@ -113,7 +128,7 @@ def run_hf(args: argparse.Namespace) -> tuple[float, int, dict[str, Any]]:
             )
         return sum(n for _, n in batch)  # only the tokens that were asked for count
 
-    generate(requests[:2])
+    generate([(p, WARMUP_TOKENS) for p, _ in requests[: min(bs, WARMUP_REQUESTS)]])
     _sync()
     start = time.perf_counter()
     out = sum(generate(requests[i : i + bs]) for i in range(0, len(requests), bs))
@@ -136,7 +151,9 @@ def run_vllm(args: argparse.Namespace) -> tuple[float, int, dict[str, Any]]:
     requests = make_requests(args, llm.get_tokenizer().vocab_size)
     prompts = [{"prompt_token_ids": p} for p, _ in requests]
     params = [VSamplingParams(max_tokens=n, temperature=0.0, ignore_eos=True) for _, n in requests]
-    llm.generate(prompts[:2], VSamplingParams(max_tokens=4), use_tqdm=False)
+    warm = VSamplingParams(max_tokens=WARMUP_TOKENS, temperature=0.0, ignore_eos=True)
+    llm.generate(prompts[:WARMUP_REQUESTS], warm, use_tqdm=False)
+    llm.reset_prefix_cache()  # the timed run must not hit warm-up blocks
     start = time.perf_counter()
     outs = llm.generate(prompts, params, use_tqdm=False)
     elapsed = time.perf_counter() - start
@@ -174,10 +191,13 @@ def main() -> None:
     p.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     p.add_argument("--kv-cache-memory-gb", type=float, default=4.0)
     p.add_argument("--hf-batch-size", type=int, default=32)
+    p.add_argument("--enforce-eager", action="store_true", help="minillm: no CUDA graphs")
     p.add_argument("--vllm-enforce-eager", action="store_true")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--output", default=None)
     args = p.parse_args()
+    logging.basicConfig(level="WARNING", format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logging.getLogger("minillm").setLevel("INFO")  # KV sizing, graph capture, periodic throughput
 
     runner = {"minillm": run_minillm, "hf": run_hf, "vllm": run_vllm}[args.engine]
     elapsed, out_tokens, extra = runner(args)
