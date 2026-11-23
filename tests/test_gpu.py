@@ -6,6 +6,8 @@ package actually loads (run them with scripts/gpu_validate.sh).
 
 from __future__ import annotations
 
+import time
+
 import pytest
 import torch
 
@@ -161,3 +163,94 @@ def test_engine_is_as_accurate_as_reference_backend(
         if name == backend and not eager:
             assert graphs is not None and graphs.replays > 0
     assert scores[backend] >= scores["torch"] - 0.02, scores
+
+
+@pytest.mark.parametrize(("backend", "eager"), ENGINE_CASES[:2])
+def test_async_scheduling_matches_sync_exactly(
+    backend: str, eager: bool, tiny_qwen2_hd64: str
+) -> None:
+    """Async scheduling changes when the CPU sees each token, not what is computed.
+
+    With a roomy cache and only length limits, both modes run the same batch at
+    every step, so even bf16 outputs (and sampled ones, whose random draws line
+    up) must match exactly. This exercises the GPU-side gather of the previous
+    step's tokens in graph replays and in eager steps that mix prompt chunks in.
+    """
+    prompts = [[(11 * i + j) % 500 + 3 for j in range(5 + 29 * i)] for i in range(8)]
+    params = [
+        SamplingParams(max_tokens=24 + 3 * i, temperature=0.0, ignore_eos=True) for i in range(7)
+    ]
+    params.append(
+        SamplingParams(max_tokens=40, temperature=0.8, top_p=0.9, top_k=20, ignore_eos=True)
+    )
+    outputs = {}
+    for async_scheduling in (False, True):
+        engine = LLMEngine(
+            EngineConfig(
+                model=tiny_qwen2_hd64,
+                device="cuda",
+                dtype="bfloat16",
+                attention_backend=backend,
+                max_model_len=512,
+                num_kv_blocks=512,
+                max_num_batched_tokens=64,
+                enforce_eager=eager,
+                async_scheduling=async_scheduling,
+            )
+        )
+        outputs[async_scheduling] = [r.output_token_ids for r in engine.generate(prompts, params)]
+    assert outputs[True] == outputs[False]
+
+
+def _spin_cycles_per_ms() -> float:
+    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    torch.cuda._sleep(1_000_000)
+    start.record()
+    torch.cuda._sleep(10_000_000)
+    end.record()
+    end.synchronize()
+    return 10_000_000 / start.elapsed_time(end)
+
+
+@pytest.mark.parametrize("eager", [False, True], ids=["cudagraphs", "eager"])
+@pytest.mark.skipif(not _importable("flashinfer"), reason="flashinfer not usable")
+def test_launching_a_step_never_waits_for_the_gpu(eager: bool, tiny_qwen2_hd64: str) -> None:
+    """Any device-to-host sync while launching a step would stall async scheduling.
+
+    Queue half a second of GPU spinning, then step the engine: it launches the
+    next step behind the spin and collects the previous one, queued before it.
+    A launch that synchronized anywhere (PyTorch, FlashInfer's planning) would
+    take the whole half second. Covers decode steps (graph replay or eager),
+    a step with a prompt chunk, and the sampling path for temperature > 0.
+    """
+    engine = LLMEngine(
+        EngineConfig(
+            model=tiny_qwen2_hd64,
+            device="cuda",
+            dtype="bfloat16",
+            attention_backend="flashinfer",
+            max_model_len=1024,
+            max_num_batched_tokens=64,
+            enforce_eager=eager,
+        )
+    )
+    sampled = SamplingParams(max_tokens=300, temperature=0.8, top_p=0.9, top_k=20, ignore_eos=True)
+    engine.add_request(list(range(3, 40)), sampled)
+    for _ in range(4):
+        engine.step()
+    spin_ms = 500
+    cycles = int(spin_ms * _spin_cycles_per_ms())
+    for new_prompt in (0, 200):  # a decode-only step, then one with a prompt chunk
+        if new_prompt:
+            engine.add_request(list(range(5, 5 + new_prompt)), SamplingParams(max_tokens=4))
+        engine.step()
+        torch.cuda._sleep(cycles)
+        t0 = time.perf_counter()
+        engine.step()
+        elapsed_ms = 1e3 * (time.perf_counter() - t0)
+        behind = torch.cuda.Event()
+        behind.record()
+        assert not behind.query(), "the GPU finished spinning before the step returned"
+        assert elapsed_ms < spin_ms / 5, f"step took {elapsed_ms:.0f} ms: something synchronized"
+    while engine.has_unfinished_requests():
+        engine.step()

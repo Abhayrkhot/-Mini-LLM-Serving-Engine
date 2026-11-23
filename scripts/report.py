@@ -32,7 +32,8 @@ def offline_table(rows: list[dict[str, Any]]) -> str:
     for ratio in sorted({r.get("range_ratio", 0.0) for r in rows}):
         group = {r["engine"]: r for r in rows if r.get("range_ratio", 0.0) == ratio}
         workload = "uniform lengths" if ratio == 0 else f"lengths ±{ratio:.0%}"
-        for engine in ("minillm", "hf", "vllm"):
+        variants = sorted(e for e in group if e.startswith("minillm"))
+        for engine in (*variants, "hf", "vllm"):
             r = group.get(engine)
             if r is None:
                 continue

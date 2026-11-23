@@ -6,6 +6,7 @@ import pytest
 
 from minillm import AsyncLLMEngine, EngineConfig, LLMEngine, SamplingParams
 from minillm.async_engine import EngineDeadError
+from minillm.executor.base import StepHandle
 from minillm.executor.fake import FakeExecutor
 from minillm.scheduler import ScheduledSeq
 
@@ -71,10 +72,10 @@ async def test_invalid_request_raises_in_the_caller():
 
 
 class CrashingExecutor(FakeExecutor):
-    def execute(self, scheduled: list[ScheduledSeq]) -> list[int]:
+    def execute_async(self, scheduled: list[ScheduledSeq]) -> StepHandle:
         if len(self.history) >= 3:
             raise RuntimeError("CUDA error: an illegal memory access was encountered")
-        return super().execute(scheduled)
+        return super().execute_async(scheduled)
 
 
 async def test_engine_crash_fails_in_flight_and_new_requests():

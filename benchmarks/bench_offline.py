@@ -67,6 +67,7 @@ def run_minillm(args: argparse.Namespace) -> tuple[float, int, dict[str, Any]]:
             kv_cache_memory_gb=args.kv_cache_memory_gb,
             max_model_len=_max_len(args),
             enforce_eager=args.enforce_eager,
+            async_scheduling=args.async_scheduling,
         )
     )
     requests = make_requests(args, engine.executor.vocab_size)
@@ -192,8 +193,15 @@ def main() -> None:
     p.add_argument("--kv-cache-memory-gb", type=float, default=4.0)
     p.add_argument("--hf-batch-size", type=int, default=32)
     p.add_argument("--enforce-eager", action="store_true", help="minillm: no CUDA graphs")
+    p.add_argument(
+        "--no-async-scheduling",
+        dest="async_scheduling",
+        action="store_false",
+        help="minillm: wait for each step's tokens before scheduling the next",
+    )
     p.add_argument("--vllm-enforce-eager", action="store_true")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--label", default=None, help="engine name to record (default: --engine)")
     p.add_argument("--output", default=None)
     args = p.parse_args()
     logging.basicConfig(level="WARNING", format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -204,7 +212,7 @@ def main() -> None:
     rng_vocab = 32_000  # lengths do not depend on the vocabulary
     in_tokens = sum(len(p) for p, _ in make_requests(args, rng_vocab))
     result = {
-        "engine": args.engine,
+        "engine": args.label or args.engine,
         "model": args.model,
         "num_prompts": args.num_prompts,
         "input_len": args.input_len,

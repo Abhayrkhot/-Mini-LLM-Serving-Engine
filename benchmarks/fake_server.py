@@ -38,6 +38,7 @@ def main() -> None:
     p.add_argument("--base-ms", type=float, default=4.0, help="fixed cost per step")
     p.add_argument("--per-token-us", type=float, default=20.0, help="cost per computed token")
     p.add_argument("--no-engine-process", dest="engine_process", action="store_false")
+    p.add_argument("--no-async-scheduling", dest="async_scheduling", action="store_false")
     args = p.parse_args()
     logging.basicConfig(level="INFO", format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
@@ -53,6 +54,7 @@ def main() -> None:
         max_num_batched_tokens=args.max_num_batched_tokens,
         enable_chunked_prefill=args.chunked,
         enable_prefix_caching=args.prefix,
+        async_scheduling=args.async_scheduling,
     )
     metrics = EngineMetrics()
     engine: EngineClient

@@ -39,6 +39,9 @@ class EngineConfig:
 
     enforce_eager: bool = False
     """Disable decode CUDA graphs (used with the flashinfer backend on CUDA)."""
+    async_scheduling: bool = True
+    """Schedule and launch step n+1 while the GPU runs step n. A request that stops on
+    EOS or a stop token then costs one discarded extra token of compute."""
 
     seed: int = 0
 

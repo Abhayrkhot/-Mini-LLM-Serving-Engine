@@ -7,8 +7,9 @@ forward pass as a CUDA graph turns those launches into one replay.
 Graphs need fixed shapes and fixed memory addresses, so:
   * one graph is captured per batch size in ``sizes``, and a decode batch is
     padded up to the nearest one;
-  * inputs (token ids, positions, KV slots) live in static buffers that are
-    overwritten before each replay;
+  * inputs (token ids, positions, KV slots) live in one static buffer that a
+    single host-to-device copy overwrites before each replay; inputs the
+    previous step sampled are then gathered into it on the GPU;
   * padded rows write their K/V to a scratch block the block manager never
     hands out, and attend over just that block;
   * each size gets its own FlashInfer decode wrapper with fixed index buffers;
@@ -27,11 +28,11 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from minillm.layers.attention import AttentionMetadata
+from minillm.layers.attention import AttentionMetadata, paged_kv_layout, pinned_views
 from minillm.utils import cdiv
 
 if TYPE_CHECKING:
-    from minillm.executor.model_runner import ModelRunner
+    from minillm.executor.model_runner import ModelRunner, _Batch
 
 logger = logging.getLogger(__name__)
 
@@ -51,15 +52,17 @@ class DecodeGraphs:
         self.sizes = capture_sizes(max_batch)
         self.scratch_block = scratch_block
         self.replays = 0
-        mc = runner.model_config
         device = runner.device
         largest = self.sizes[-1]
         bs = runner.block_size
         self.max_pages = largest * cdiv(runner.max_model_len, bs)
 
-        self.input_ids = torch.zeros(largest, dtype=torch.long, device=device)
-        self.positions = torch.zeros(largest, dtype=torch.long, device=device)
-        self.slots = torch.full((largest,), scratch_block * bs, dtype=torch.long, device=device)
+        # [token ids | positions | KV slots], ``largest`` entries each.
+        self.static = torch.zeros(3 * largest, dtype=torch.long, device=device)
+        self.input_ids = self.static[:largest]
+        self.positions = self.static[largest : 2 * largest]
+        self.slots = self.static[2 * largest :]
+        self.slots.fill_(scratch_block * bs)
 
         workspace = runner.flashinfer.workspace
         self.wrappers: dict[int, Any] = {}
@@ -78,38 +81,22 @@ class DecodeGraphs:
                 ),
                 paged_kv_last_page_len_buffer=torch.zeros(b, dtype=torch.int32, device=device),
             )
-        self._plan_kwargs = dict(
-            sm_scale=mc.head_dim**-0.5, q_data_type=runner.dtype, kv_data_type=runner.dtype
-        )
+        self._plan_kwargs = runner.flashinfer.kwargs
         self._capture()
 
     def _plan(self, b: int, tables: list[list[int]], seq_lens: list[int]) -> None:
         """Plan size ``b``'s wrapper for the real sequences plus scratch padding rows."""
-        bs = self.runner.block_size
-        mc = self.runner.model_config
-        indptr, indices, last = [0], [], []
-        for table, seq_len in zip(tables, seq_lens, strict=True):
-            pages = cdiv(seq_len, bs)
-            indices.extend(table[:pages])
-            indptr.append(indptr[-1] + pages)
-            last.append(seq_len - (pages - 1) * bs)
-        for _ in range(b - len(tables)):
-            indices.append(self.scratch_block)
-            indptr.append(indptr[-1] + 1)
-            last.append(1)
-
-        def i32(xs: list[int]) -> torch.Tensor:
-            return torch.tensor(xs, dtype=torch.int32)
-
-        self.wrappers[b].plan(
-            i32(indptr),
-            i32(indices),
-            i32(last),
-            mc.num_heads,
-            mc.num_kv_heads,
-            mc.head_dim,
-            bs,
-            **self._plan_kwargs,
+        planner = self.runner.flashinfer
+        assert planner is not None
+        indptr, indices, last = paged_kv_layout(
+            tables, seq_lens, self.runner.block_size, b - len(tables), self.scratch_block
+        )
+        indptr_h, last_h, indices_h = pinned_views([indptr, last, indices], torch.int32, pin=True)
+        # Indices go over already on the device: from host memory, a CUDA-graph
+        # wrapper copies them synchronously, which would stall async scheduling.
+        indices_d = indices_h.to(self.static.device, non_blocking=True)
+        planner.run_plan(
+            self.wrappers[b], indptr_h, indices_d, last_h, *planner.shape, **self._plan_kwargs
         )
 
     @torch.inference_mode()
@@ -154,29 +141,21 @@ class DecodeGraphs:
     def can_run(self, num_seqs: int) -> bool:
         return num_seqs <= self.sizes[-1]
 
-    def run(
-        self,
-        input_ids: list[int],
-        positions: list[int],
-        slots: list[int],
-        tables: list[list[int]],
-        seq_lens: list[int],
-    ) -> torch.Tensor:
+    def run(self, batch: _Batch) -> torch.Tensor:
         """Replay the graph for this decode batch; returns hidden states for the real rows."""
-        n = len(input_ids)
+        n = batch.num_seqs
         b = self.sizes[bisect.bisect_left(self.sizes, n)]
-        pad = b - n
+        gap = len(self.input_ids) - n  # up to the next segment of the static buffer
         scratch_slot = self.scratch_block * self.runner.block_size
-
-        def staged(xs: list[int]) -> torch.Tensor:
-            return torch.tensor(xs, dtype=torch.long, pin_memory=True).to(
-                self.input_ids.device, non_blocking=True
-            )
-
-        self.input_ids[:b].copy_(staged(input_ids + [0] * pad))
-        self.positions[:b].copy_(staged(positions + [0] * pad))
-        self.slots[:b].copy_(staged(slots + [scratch_slot] * pad))
-        self._plan(b, tables, seq_lens)
+        host = [
+            *batch.input_ids, *[0] * gap,
+            *batch.positions, *[0] * gap,
+            *batch.slots, *[scratch_slot] * (b - n),
+        ]  # fmt: skip
+        staged = torch.tensor(host, dtype=torch.long, pin_memory=True)
+        self.static[: len(host)].copy_(staged, non_blocking=True)
+        self.runner.gather_pending(self.input_ids, batch)
+        self._plan(b, batch.tables, batch.seq_lens)
         self.graphs[b].replay()
         self.replays += 1
         return self.outputs[b][:n]

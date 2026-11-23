@@ -24,11 +24,17 @@ class Sequence:
 
     The engine never distinguishes "prefill" from "decode". Each sequence has
     ``num_tokens`` tokens (prompt plus everything generated so far) of which the
-    first ``num_computed_tokens`` already have their K/V in the paged cache. A
-    scheduling step computes some of the remaining tokens; when it catches up to
-    ``num_tokens`` the model samples one new token. A fresh prompt, a chunk of a
-    long prompt, a decode step and a recompute after preemption are all the same
-    operation.
+    first ``num_computed_tokens`` have their K/V in the paged cache, or are being
+    written by a step already sent to the GPU. A scheduling step computes some of
+    the remaining tokens; when it catches up to ``num_tokens`` the model samples
+    one new token. A fresh prompt, a chunk of a long prompt, a decode step and a
+    recompute after preemption are all the same operation.
+
+    With async scheduling the engine schedules step n+1 before step n's sampled
+    tokens reach the CPU. Those tokens exist only on the GPU for a while:
+    ``num_pending_tokens`` counts them (0 to 2), and ``num_tokens`` includes them,
+    so the scheduler plans as if they had arrived. ``token_ids`` holds only the
+    tokens the CPU has seen.
     """
 
     def __init__(
@@ -47,6 +53,9 @@ class Sequence:
         self.status = SequenceStatus.WAITING
         self.finish_reason: FinishReason | None = None
 
+        # Sampled by a step in flight, not yet seen by the CPU.
+        self.num_pending_tokens = 0
+
         # Paged KV-cache state, owned by the BlockManager.
         self.num_computed_tokens = 0
         self.block_table: list[int] = []
@@ -64,10 +73,12 @@ class Sequence:
 
     @property
     def num_tokens(self) -> int:
-        return len(self.token_ids)
+        """Tokens the scheduler plans with: known tokens plus pending ones."""
+        return len(self.token_ids) + self.num_pending_tokens
 
     @property
     def num_output_tokens(self) -> int:
+        """Generated tokens the CPU has seen (pending ones excluded)."""
         return len(self.token_ids) - self.num_prompt_tokens
 
     @property

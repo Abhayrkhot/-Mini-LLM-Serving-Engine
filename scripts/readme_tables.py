@@ -3,7 +3,7 @@
     python scripts/readme_tables.py            # markdown for the Benchmarks section
 
 Each results/h200-<model> directory holds one benchmark run (scripts/explorer/bench.sh);
-an optional results/h200-<model>-eager directory holds the same run with CUDA graphs off.
+results/h200-profile holds benchmarks/profile_step.py output per model.
 """
 
 from __future__ import annotations
@@ -37,20 +37,58 @@ def fmt(x: float | None, suffix: str = "") -> str:
 
 def offline_table() -> str:
     rows = [
-        "| model | workload | minillm | minillm, no CUDA graphs | HF `generate` | vLLM 0.34 "
+        "| model | workload | minillm | minillm, sync scheduling | HF `generate` | vLLM 0.34 "
         "| minillm vs HF | minillm vs vLLM |",
         "|---|---|---:|---:|---:|---:|---:|---:|",
     ]
     for name, d in MODELS:
         for ratio, label in (("0", "uniform lengths"), ("0.9", "lengths vary ±90%")):
-            m, e = tput(d, "minillm", ratio), tput(f"{d}-eager", "minillm", ratio)
+            m, sync = tput(d, "minillm", ratio), tput(d, "minillm-sync", ratio)
             hf, vllm = tput(d, "hf", ratio), tput(d, "vllm", ratio)
             vs_hf = f"{m / hf:.1f}×" if m and hf else "–"
             vs_vllm = f"{100 * m / vllm:.0f}%" if m and vllm else "–"
             rows.append(
-                f"| {name} | {label} | {fmt(m)} | {fmt(e)} | {fmt(hf)} | {fmt(vllm)} "
+                f"| {name} | {label} | {fmt(m)} | {fmt(sync)} | {fmt(hf)} | {fmt(vllm)} "
                 f"| {vs_hf} | {vs_vllm} |"
             )
+    return "\n".join(rows)
+
+
+def profile_table() -> str:
+    rows = [
+        "| model | batch | GPU | engine CPU | step, sync | step, async |",
+        "|---|---:|---:|---:|---:|---:|",
+    ]
+    for name, d in MODELS:
+        r = load(os.path.join(ROOT, "h200-profile", f"{d.removeprefix('h200-')}.json"))
+        for row in (r or {}).get("rows", []):
+            rows.append(
+                f"| {name} | {row['batch']} | {row['gpu_ms']:.2f} | {row['async_cpu_ms']:.2f} "
+                f"| {row['sync_step_ms']:.2f} | {row['async_step_ms']:.2f} |"
+            )
+    return "\n".join(rows)
+
+
+def kernel_summary() -> str:
+    """GPU time of one batch-1 decode step: GEMMs, attention and everything else."""
+    rows = [
+        "| model | kernel launches | GPU time | GEMMs | attention | other kernels |",
+        "|---|---:|---:|---:|---:|---:|",
+    ]
+    for name, d in MODELS:
+        r = load(os.path.join(ROOT, "h200-profile", f"{d.removeprefix('h200-')}.json"))
+        if not r or "kernels" not in r:
+            continue
+        ks = r["kernels"]["rows"]
+        total = sum(k["us"] for k in ks)
+        gemm = sum(k["us"] for k in ks if "nvjet" in k["kernel"] or "cublas" in k["kernel"].lower())
+        attn = sum(k["us"] for k in ks if "flashinfer" in k["kernel"])
+        other = total - gemm - attn
+        rows.append(
+            f"| {name} | {sum(k['launches'] for k in ks):,.0f} | {total / 1e3:.2f} ms "
+            f"| {gemm / 1e3:.2f} ms | {attn / 1e3:.2f} ms "
+            f"| {other / 1e3:.2f} ms ({100 * other / total:.0f}%) |"
+        )
     return "\n".join(rows)
 
 
@@ -76,7 +114,7 @@ def serving_table(directory: str) -> str:
 
 
 def main() -> None:
-    out = [offline_table()]
+    out = [offline_table(), profile_table(), kernel_summary()]
     for name, d in MODELS:
         if glob.glob(os.path.join(ROOT, d, "serve_*_rate*.json")):
             out += [f"**{name}, online** (500 requests per point)", serving_table(d)]

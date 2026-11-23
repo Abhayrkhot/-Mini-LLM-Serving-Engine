@@ -190,7 +190,9 @@ class BlockManager:
         if not self.enable_prefix_caching:
             return
         bs = self.block_size
-        num_full = seq.num_computed_tokens // bs
+        # Computed tokens can run ahead of the known ones: with async scheduling a
+        # step in flight may be computing a token the CPU has not seen yet.
+        num_full = min(seq.num_computed_tokens, len(seq.token_ids)) // bs
         for i in range(len(seq.block_hashes), num_full):
             toks = tuple(seq.token_ids[i * bs : (i + 1) * bs])
             parent = seq.block_hashes[i - 1] if i > 0 else None

@@ -1,0 +1,22 @@
+{
+  "engine": "minillm-sync",
+  "model": "Qwen/Qwen2.5-0.5B-Instruct",
+  "num_prompts": 500,
+  "input_len": 512,
+  "output_len": 128,
+  "range_ratio": 0.0,
+  "elapsed_s": 2.70145714469254,
+  "output_tokens": 64000,
+  "output_throughput": 23690.91811274467,
+  "total_token_throughput": 118454.59056372335,
+  "request_throughput": 185.08529775581775,
+  "gpu": "NVIDIA H200",
+  "torch": "2.14.0+cu130",
+  "preemptions": 0,
+  "kv_blocks": 10496,
+  "block_size": 16,
+  "attention_backend": "flashinfer",
+  "cuda_graphs": true,
+  "dtype": "torch.bfloat16",
+  "device": "cuda"
+}

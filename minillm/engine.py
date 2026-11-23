@@ -10,7 +10,7 @@ from dataclasses import dataclass
 
 from minillm.block_manager import BlockManager
 from minillm.config import EngineConfig
-from minillm.executor.base import Executor
+from minillm.executor.base import Executor, StepHandle
 from minillm.metrics import EngineMetrics, EngineStats, FinishedRequest
 from minillm.sampling import SamplingParams
 from minillm.scheduler import Scheduler, SchedulerOutput, TokenEvent
@@ -33,6 +33,16 @@ class TokenOutput:
     num_prompt_tokens: int
     num_output_tokens: int
     num_cached_tokens: int
+
+
+@dataclass
+class _Step:
+    """A launched step whose tokens have not been collected yet."""
+
+    output: SchedulerOutput
+    handle: StepHandle
+    launched: float
+    prefill_tokens: int
 
 
 @dataclass(frozen=True)
@@ -87,6 +97,9 @@ class LLMEngine:
             enable_chunked_prefill=config.enable_chunked_prefill,
             eos_token_ids=self.eos_token_ids,
         )
+        self.async_scheduling = config.async_scheduling
+        self._inflight: _Step | None = None
+        self._last_ready = 0.0
         self._requests: dict[str, Sequence] = {}
         self._ids = itertools.count()
         self._stats = EngineStats()
@@ -126,11 +139,16 @@ class LLMEngine:
             return False
         self.scheduler.abort(seq)
         self._record_finished(seq)
+        if not self._requests and self._inflight is not None:
+            # Nothing left to wait for; collect the step now rather than leave it.
+            step, self._inflight = self._inflight, None
+            self._complete(step)
         self._flush_metrics()
         return True
 
     def has_unfinished_requests(self) -> bool:
-        return bool(self._requests)
+        """True while requests are outstanding or a launched step is uncollected."""
+        return bool(self._requests) or self._inflight is not None
 
     @property
     def num_unfinished_requests(self) -> int:
@@ -139,20 +157,42 @@ class LLMEngine:
     # ------------------------------------------------------------------ stepping
 
     def step(self) -> list[TokenOutput]:
+        """Run one engine iteration; return the tokens that became available.
+
+        Synchronous: schedule a step, run it, return its tokens. Async: schedule
+        and launch step n+1, then wait for step n's tokens and return those, so
+        the CPU's work on one step overlaps the GPU's work on the other.
+        """
         output = self.scheduler.schedule()
-        if output.is_empty:
-            self._flush_metrics()
-            return []
-        prefill_tokens = sum(
-            s.num_new_tokens
-            for s in output.scheduled
-            if s.seq.num_computed_tokens < s.seq.num_prompt_tokens
-        )
-        start = time.perf_counter()
-        sampled = self.executor.execute(output.scheduled)
-        elapsed = time.perf_counter() - start
-        events = self.scheduler.update(output, sampled)
-        self._record_step(output, events, elapsed, prefill_tokens)
+        launched = None
+        if not output.is_empty:
+            prefill_tokens = sum(
+                s.num_new_tokens for s in output.scheduled if s.start < s.seq.num_prompt_tokens
+            )
+            start = time.perf_counter()
+            handle = self.executor.execute_async(output.scheduled)
+            launched = _Step(output, handle, start, prefill_tokens)
+
+        previous, self._inflight = self._inflight, None
+        results = self._complete(previous) if previous is not None else []
+        if launched is not None:
+            if self.async_scheduling:
+                self._inflight = launched
+            else:
+                results.extend(self._complete(launched))
+        self._flush_metrics()
+        return results
+
+    def _complete(self, step: _Step) -> list[TokenOutput]:
+        """Wait for a launched step's tokens and apply them."""
+        sampled = step.handle.result()
+        ready = time.perf_counter()
+        # Time on the device: from when the step could start (its launch, or the
+        # previous step finishing, whichever was later) until its tokens arrived.
+        elapsed = ready - max(step.launched, self._last_ready)
+        self._last_ready = ready
+        events = self.scheduler.update(step.output, sampled)
+        self._record_step(step.output, events, elapsed, step.prefill_tokens)
 
         results = []
         for ev in events:
@@ -171,7 +211,6 @@ class LLMEngine:
                     num_cached_tokens=seq.num_cached_tokens,
                 )
             )
-        self._flush_metrics()
         return results
 
     def take_stats(self) -> EngineStats:
