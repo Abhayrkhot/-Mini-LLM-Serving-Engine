@@ -4,7 +4,9 @@
 # Env: NUM_PROMPTS (500), ENGINES (offline: "minillm vllm hf"), SERVE_ENGINES ("minillm vllm"),
 #      SKIP_OFFLINE / SKIP_ONLINE (1 to skip), MINILLM_ARGS (extra minillm flags, e.g.
 #      --enforce-eager), WORKERS (load-generator processes, default 4).
-#      SERVE_ENGINES may include minillm-1proc: the engine on a thread in the API process.
+#      minillm variants (ENGINES and SERVE_ENGINES): minillm-sync waits for each step's
+#      tokens before scheduling the next (--no-async-scheduling); minillm-1proc (online
+#      only) runs the engine on a thread in the API process.
 #      Results: $ROOT/results/<tag>/ + REPORT.md.
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -16,6 +18,12 @@ OUT=$ROOT/results/$TAG; mkdir -p "$OUT"; cd "$REPO"
 export PORT=$(( 20000 + ${SLURM_JOB_ID:-$$} % 20000 ))
 nvidia-smi > "$OUT/nvidia-smi.txt"
 LIMITS=(--max-num-seqs 256 --max-num-batched-tokens 8192)
+variant_flags() {  # flags for a minillm variant label
+  case $1 in
+    minillm-sync) echo --no-async-scheduling ;;
+    minillm-1proc) echo --no-engine-process ;;
+  esac
+}
 N=${NUM_PROMPTS:-500}
 WORKERS=${WORKERS:-4}  # one client process tops out near 10k streamed tokens/s
 
@@ -24,8 +32,9 @@ if [ "${SKIP_OFFLINE:-0}" != 1 ]; then
     common=(--model "$MODEL" --num-prompts "$N" --input-len 512 --output-len 128 --range-ratio "$ratio" "${LIMITS[@]}")
     for engine in ${ENGINES:-minillm vllm hf}; do
       echo "[$(date +%T)] offline $engine ratio=$ratio"
-      extra=(); [ "$engine" = minillm ] && extra=(${MINILLM_ARGS:-})
-      img python3 benchmarks/bench_offline.py --engine "$engine" "${common[@]}" "${extra[@]}" --hf-batch-size 64 \
+      extra=(); kind=$engine
+      case $engine in minillm*) kind=minillm; extra=(--label "$engine" $(variant_flags "$engine") ${MINILLM_ARGS:-}) ;; esac
+      img python3 benchmarks/bench_offline.py --engine "$kind" "${common[@]}" "${extra[@]}" --hf-batch-size 64 \
         --output "$OUT/offline_${engine}_r${ratio}.json" > "$OUT/offline_${engine}_r${ratio}.log" 2>&1 \
         || { echo "  FAILED"; tail -20 "$OUT/offline_${engine}_r${ratio}.log"; }
       grep -E '"output_throughput"' "$OUT/offline_${engine}_r${ratio}.json" 2>/dev/null
@@ -51,10 +60,9 @@ sweep() {  # sweep <label>; every point gets fresh prompts (its own seed) so no 
 
 if [ "${SKIP_ONLINE:-0}" != 1 ]; then
   for engine in ${SERVE_ENGINES:-minillm vllm}; do
-    if [ "$engine" = minillm ] || [ "$engine" = minillm-1proc ]; then
-      mode=(); [ "$engine" = minillm-1proc ] && mode=(--no-engine-process)
+    if [[ $engine == minillm* ]]; then
       start_server "$OUT/${engine}_server.log" python3 -m minillm.entrypoints.openai_server \
-        --model "$MODEL" --host 127.0.0.1 --port "$PORT" "${LIMITS[@]}" "${mode[@]}" ${MINILLM_ARGS:-} \
+        --model "$MODEL" --host 127.0.0.1 --port "$PORT" "${LIMITS[@]}" $(variant_flags "$engine") ${MINILLM_ARGS:-} \
         --log-level warning && sweep "$engine"
     else
       start_server "$OUT/vllm_server.log" vllm serve "$MODEL" --host 127.0.0.1 --port "$PORT" \
