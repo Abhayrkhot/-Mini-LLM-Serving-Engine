@@ -6,13 +6,15 @@ import importlib
 import logging
 import os
 import time
+from dataclasses import dataclass, field
 
 import torch
 
 from minillm.config import EngineConfig
+from minillm.executor.base import DoneStep, StepHandle
 from minillm.executor.cuda_graphs import DecodeGraphs
 from minillm.layers.attention import AttentionMetadata, FlashInferPlanner
-from minillm.layers.sampler import sample
+from minillm.layers.sampler import is_greedy, sample
 from minillm.models.llama import ModelConfig
 from minillm.models.loader import (
     build_model,
@@ -22,6 +24,7 @@ from minillm.models.loader import (
     resolve_model_path,
 )
 from minillm.scheduler import ScheduledSeq
+from minillm.sequence import Sequence
 from minillm.utils import cdiv
 
 logger = logging.getLogger(__name__)
@@ -77,6 +80,46 @@ def resolve_backend(name: str, device: torch.device) -> str:
     return name
 
 
+@dataclass
+class _Batch:
+    """One step's inputs: host lists, then the device tensors made from them."""
+
+    num_seqs: int
+    input_ids: list[int] = field(default_factory=list)
+    positions: list[int] = field(default_factory=list)
+    slots: list[int] = field(default_factory=list)
+    query_lens: list[int] = field(default_factory=list)
+    seq_lens: list[int] = field(default_factory=list)
+    tables: list[list[int]] = field(default_factory=list)
+    sample_rows: list[int] = field(default_factory=list)  # flat index of each sampler's last input
+    sampling: list[Sequence] = field(default_factory=list)
+    temps: list[float] = field(default_factory=list)
+    top_ps: list[float] = field(default_factory=list)
+    top_ks: list[int] = field(default_factory=list)
+    # Input positions holding a token the previous step sampled (still on the
+    # GPU), and that token's row in the previous step's output.
+    pending_dst: list[int] = field(default_factory=list)
+    pending_src: list[int] = field(default_factory=list)
+    dev: dict[str, torch.Tensor] = field(default_factory=dict)
+
+    @property
+    def decode_only(self) -> bool:
+        return max(self.query_lens) == 1
+
+
+class _CudaStep:
+    """Sampled tokens on their way to a pinned host buffer."""
+
+    def __init__(self, host: torch.Tensor, done: torch.cuda.Event) -> None:
+        self.host = host
+        self.done = done
+
+    def result(self) -> list[int]:
+        self.done.synchronize()
+        tokens: list[int] = self.host.tolist()
+        return tokens
+
+
 class ModelRunner:
     def __init__(self, config: EngineConfig) -> None:
         self.config = config
@@ -124,6 +167,14 @@ class ModelRunner:
         self.generator = torch.Generator(device=self.device)
         self.generator.manual_seed(config.seed)
         self.num_kv_blocks = self._init_kv_cache()
+
+        # Tokens the latest step sampled, still on the device, and each sampling
+        # sequence's row in them: the next step may need them as inputs.
+        self._prev_tokens: torch.Tensor | None = None
+        self._prev_rows: dict[Sequence, int] = {}
+        # FlashInfer reads pages through its planned wrapper, not a block-table
+        # tensor; this empty one only marks that the KV cache is in use.
+        self._cache_marker = torch.empty(0, 0, dtype=torch.int32, device=self.device)
 
         # Decode CUDA graphs: CUDA + FlashInfer only (its decode kernel supports capture).
         self.graphs: DecodeGraphs | None = None
@@ -256,106 +307,176 @@ class ModelRunner:
         return t.to(self.device, non_blocking=True)
 
     @torch.inference_mode()
-    def execute(self, scheduled: list[ScheduledSeq]) -> list[int]:
+    def execute_async(self, scheduled: list[ScheduledSeq]) -> StepHandle:
+        """Launch one step and return without waiting for the GPU.
+
+        Nothing on this path synchronizes with the device: inputs go over
+        through pinned memory, tokens the previous step sampled are gathered on
+        the GPU, and this step's tokens come back through a pinned buffer whose
+        copy a CUDA event tracks.
+        """
         if not scheduled:
-            return []
-        logits, temps, top_ps, top_ks = self._forward(scheduled)
-        if logits is None:
-            return []
-        tokens = sample(logits, temps, top_ps, top_ks, self.generator)
-        result: list[int] = tokens.tolist()
-        return result
+            return DoneStep([])
+        batch = self._prepare(scheduled)
+        hidden = self._run_model(batch)
+        if not batch.sampling:
+            self._prev_tokens, self._prev_rows = None, {}
+            return DoneStep([])
+        tokens = self._sample(hidden, batch)
+        self._prev_tokens = tokens
+        self._prev_rows = {seq: row for row, seq in enumerate(batch.sampling)}
+        return self._to_host(tokens)
+
+    def execute(self, scheduled: list[ScheduledSeq]) -> list[int]:
+        return self.execute_async(scheduled).result()
 
     @torch.inference_mode()
     def compute_logits(self, scheduled: list[ScheduledSeq]) -> torch.Tensor | None:
         """Run the batch and return float32 logits for the sequences that sample (for tests)."""
-        return self._forward(scheduled)[0]
+        batch = self._prepare(scheduled)
+        hidden = self._run_model(batch)
+        if not batch.sampling:
+            return None
+        logits: torch.Tensor = self.model.compute_logits(hidden[batch.dev["rows"]]).float()
+        return logits
 
-    def _forward(
-        self, scheduled: list[ScheduledSeq]
-    ) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _prepare(self, scheduled: list[ScheduledSeq]) -> _Batch:
         bs = self.block_size
-        input_ids: list[int] = []
-        positions: list[int] = []
-        slots: list[int] = []
-        query_lens: list[int] = []
-        seq_lens: list[int] = []
-        cu_q, cu_k = [0], [0]
-        tables: list[list[int]] = []
-        sample_idx: list[int] = []
-        temps: list[float] = []
-        top_ps: list[float] = []
-        top_ks: list[int] = []
-
+        batch = _Batch(num_seqs=len(scheduled))
         for item in scheduled:
             seq = item.seq
-            start = seq.num_computed_tokens
+            start = item.start
             end = start + item.num_new_tokens
-            input_ids.extend(seq.token_ids[start:end])
-            positions.extend(range(start, end))
+            known = len(seq.token_ids)
+            if end <= known:
+                batch.input_ids.extend(seq.token_ids[start:end])
+            else:
+                # The last input is the token the previous step sampled for this
+                # sequence; the CPU has not seen it. Leave a hole to fill on the GPU.
+                row = self._prev_rows.get(seq)
+                if end != known + 1 or row is None:
+                    raise RuntimeError(
+                        f"{seq.request_id}: input position {end - 1} is neither known to "
+                        "the CPU nor a token the previous step sampled"
+                    )
+                batch.input_ids.extend(seq.token_ids[start:known])
+                batch.pending_dst.append(len(batch.input_ids))
+                batch.pending_src.append(row)
+                batch.input_ids.append(0)
+            batch.positions.extend(range(start, end))
             pos = start
             while pos < end:  # one contiguous slot range per block
                 block_idx, offset = divmod(pos, bs)
                 span = min(bs - offset, end - pos)
                 base = seq.block_table[block_idx] * bs + offset
-                slots.extend(range(base, base + span))
+                batch.slots.extend(range(base, base + span))
                 pos += span
-            query_lens.append(end - start)
-            seq_lens.append(end)
-            cu_q.append(cu_q[-1] + end - start)
-            cu_k.append(cu_k[-1] + end)
-            tables.append(seq.block_table)
+            batch.query_lens.append(end - start)
+            batch.seq_lens.append(end)
+            batch.tables.append(seq.block_table)
             if item.sample:
-                sample_idx.append(cu_q[-1] - 1)
-                temps.append(seq.params.temperature)
-                top_ps.append(seq.params.top_p)
-                top_ks.append(seq.params.top_k)
+                batch.sample_rows.append(len(batch.input_ids) - 1)
+                batch.sampling.append(seq)
+                params = seq.params
+                batch.temps.append(params.temperature)
+                batch.top_ps.append(params.top_p)
+                batch.top_ks.append(params.top_k)
+        return batch
 
-        if self.graphs is not None and max(query_lens) == 1 and self.graphs.can_run(len(scheduled)):
-            hidden = self.graphs.run(input_ids, positions, slots, tables, seq_lens)
-        else:
-            hidden = self._eager_forward(
-                input_ids, positions, slots, tables, query_lens, seq_lens, cu_q, cu_k
-            )
-        temps_t = self._tensor(temps, torch.float32)
-        top_ps_t = self._tensor(top_ps, torch.float32)
-        top_ks_t = self._tensor(top_ks, torch.long)
-        if not sample_idx:
-            return None, temps_t, top_ps_t, top_ks_t
-        logits = self.model.compute_logits(hidden[self._tensor(sample_idx, torch.long)]).float()
-        return logits, temps_t, top_ps_t, top_ks_t
+    def _upload(
+        self, parts: list[list[int]] | list[list[float]], dtype: torch.dtype
+    ) -> list[torch.Tensor]:
+        """Copy several host lists to the device in one transfer; return a view of each."""
+        flat = [x for part in parts for x in part]
+        dev = torch.tensor(flat, dtype=dtype, pin_memory=self._pin).to(
+            self.device, non_blocking=True
+        )
+        views, offset = [], 0
+        for part in parts:
+            views.append(dev[offset : offset + len(part)])
+            offset += len(part)
+        return views
 
-    def _eager_forward(
-        self,
-        input_ids: list[int],
-        positions: list[int],
-        slots: list[int],
-        tables: list[list[int]],
-        query_lens: list[int],
-        seq_lens: list[int],
-        cu_q: list[int],
-        cu_k: list[int],
-    ) -> torch.Tensor:
-        width = max(len(t) for t in tables)
-        padded = [t + [0] * (width - len(t)) for t in tables]
+    def _upload_ints(self, batch: _Batch, *leading: list[int]) -> list[torch.Tensor]:
+        """One copy for the step's int64 inputs: ``leading`` lists, then the
+        sampling rows, top-k values and pending-token indices (kept in ``batch.dev``)."""
+        names = ("rows", "top_ks", "pending_dst", "pending_src")
+        extras = [batch.sample_rows, batch.top_ks, batch.pending_dst, batch.pending_src]
+        views = self._upload([*leading, *extras], torch.long)
+        batch.dev.update(zip(names, views[len(leading) :], strict=True))
+        return views[: len(leading)]
+
+    def gather_pending(self, input_ids: torch.Tensor, batch: _Batch) -> None:
+        """Fill in input tokens the previous step sampled, straight from device memory."""
+        if batch.pending_dst:
+            assert self._prev_tokens is not None
+            tokens = self._prev_tokens.index_select(0, batch.dev["pending_src"])
+            input_ids.index_copy_(0, batch.dev["pending_dst"], tokens)
+
+    def _run_model(self, batch: _Batch) -> torch.Tensor:
+        if self.graphs is not None and batch.decode_only and self.graphs.can_run(batch.num_seqs):
+            self._upload_ints(batch)
+            return self.graphs.run(batch)
+        return self._eager_forward(batch)
+
+    def _eager_forward(self, batch: _Batch) -> torch.Tensor:
+        ids, positions, slots = self._upload_ints(
+            batch, batch.input_ids, batch.positions, batch.slots
+        )
+        self.gather_pending(ids, batch)
+        cu_q, cu_k = [0], [0]
+        for q_len, k_len in zip(batch.query_lens, batch.seq_lens, strict=True):
+            cu_q.append(cu_q[-1] + q_len)
+            cu_k.append(cu_k[-1] + k_len)
+        parts = [batch.query_lens, batch.seq_lens, cu_q, cu_k]
+        width = max(len(t) for t in batch.tables)
+        if self.flashinfer is None:  # the torch and flash-attn kernels take block tables
+            parts.append([x for t in batch.tables for x in (*t, *[0] * (width - len(t)))])
+        views = self._upload(parts, torch.int32)
         meta = AttentionMetadata(
             backend=self.backend,
-            num_seqs=len(tables),
-            max_seqlen_q=max(query_lens),
-            max_seqlen_k=max(seq_lens),
-            query_lens=self._tensor(query_lens, torch.int32),
-            seq_lens_k=self._tensor(seq_lens, torch.int32),
-            cu_seqlens_q=self._tensor(cu_q, torch.int32),
-            cu_seqlens_k=self._tensor(cu_k, torch.int32),
-            slot_mapping=self._tensor(slots, torch.long),
-            block_tables=torch.tensor(padded, dtype=torch.int32, pin_memory=self._pin).to(
-                self.device, non_blocking=True
-            ),
-            decode_only=max(query_lens) == 1,
+            num_seqs=batch.num_seqs,
+            max_seqlen_q=max(batch.query_lens),
+            max_seqlen_k=max(batch.seq_lens),
+            query_lens=views[0],
+            seq_lens_k=views[1],
+            cu_seqlens_q=views[2],
+            cu_seqlens_k=views[3],
+            slot_mapping=slots,
+            block_tables=views[4].view(batch.num_seqs, width)
+            if self.flashinfer is None
+            else self._cache_marker,
+            decode_only=batch.decode_only,
         )
         if self.flashinfer is not None:
-            meta.flashinfer = self.flashinfer.plan(tables, seq_lens, query_lens)
-        hidden: torch.Tensor = self.model(
-            self._tensor(input_ids, torch.long), self._tensor(positions, torch.long), meta
-        )
+            meta.flashinfer = self.flashinfer.plan(batch.tables, batch.seq_lens, batch.query_lens)
+        hidden: torch.Tensor = self.model(ids, positions, meta)
         return hidden
+
+    def _sample(self, hidden: torch.Tensor, batch: _Batch) -> torch.Tensor:
+        logits = self.model.compute_logits(hidden[batch.dev["rows"]]).float()
+        if all(is_greedy(t) for t in batch.temps):
+            tokens: torch.Tensor = logits.argmax(dim=-1)
+            return tokens
+        temps, top_ps = self._upload([batch.temps, batch.top_ps], torch.float32)
+        needs_filter = any(0 < k < self.vocab_size for k in batch.top_ks) or any(
+            p < 1.0 for p in batch.top_ps
+        )
+        return sample(
+            logits,
+            temps,
+            top_ps,
+            batch.dev["top_ks"],
+            self.generator,
+            all_greedy=False,
+            needs_filter=needs_filter,
+        )
+
+    def _to_host(self, tokens: torch.Tensor) -> StepHandle:
+        if self.device.type != "cuda":
+            return DoneStep(tokens.tolist())
+        host = torch.empty(tokens.shape, dtype=tokens.dtype, pin_memory=True)
+        host.copy_(tokens, non_blocking=True)
+        done = torch.cuda.Event()
+        done.record()
+        return _CudaStep(host, done)

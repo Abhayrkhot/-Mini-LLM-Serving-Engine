@@ -6,6 +6,12 @@ sequence's own tokens, so outputs are identical however requests are batched,
 chunked or preempted, which is exactly the property the real engine must have.
 An optional cost model makes step latency depend on batch shape, which is what
 the load tests need to show queueing and batching behaviour.
+
+Like the GPU runner, it supports async scheduling: a step's input may include
+the token the previous step sampled, which the CPU has not seen yet. The fake
+keeps those tokens to itself (its "device memory") and fails loudly if asked
+for a token it cannot supply. Its cost model plays the GPU's role: steps queue
+behind each other, and ``result`` waits until the step would have finished.
 """
 
 from __future__ import annotations
@@ -14,6 +20,7 @@ import time
 from collections.abc import Callable
 from typing import Any
 
+from minillm.executor.base import StepHandle
 from minillm.scheduler import ScheduledSeq
 from minillm.sequence import Sequence
 
@@ -35,7 +42,7 @@ class LinearCost:
 
     def __call__(self, batch: list[ScheduledSeq]) -> float:
         new_tokens = sum(s.num_new_tokens for s in batch)
-        context = sum(s.seq.num_computed_tokens + s.num_new_tokens for s in batch)
+        context = sum(s.start + s.num_new_tokens for s in batch)
         return self.base_s + self.per_token_s * new_tokens + self.per_context_token_s * context
 
 
@@ -80,14 +87,77 @@ class FakeExecutor:
         )
         # One entry per step: (request_id, num_new_tokens, sample) for each batch item.
         self.history: list[list[tuple[str, int, bool]]] = []
+        self._last_sampled: dict[Sequence, int] = {}  # by the latest step
+        self._busy_until = 0.0
 
-    def execute(self, scheduled: list[ScheduledSeq]) -> list[int]:
+    def execute_async(self, scheduled: list[ScheduledSeq]) -> StepHandle:
         if self.crash_after_steps is not None and len(self.history) >= self.crash_after_steps:
             raise RuntimeError("CUDA error: an illegal memory access was encountered (simulated)")
         self.history.append([(s.seq.request_id, s.num_new_tokens, s.sample) for s in scheduled])
+        tokens: list[int] = []
+        sampled: dict[Sequence, int] = {}
+        for s in scheduled:
+            context = self._inputs(s)
+            if s.sample:
+                token = self._next_token(_SeqView(s.seq, context))  # type: ignore[arg-type]
+                tokens.append(token)
+                sampled[s.seq] = token
+        self._last_sampled = sampled
+        ready = None
         if self.cost_model is not None:
-            time.sleep(self.cost_model(scheduled))
-        return [self._next_token(s.seq) for s in scheduled if s.sample]
+            now = time.perf_counter()
+            self._busy_until = max(now, self._busy_until) + self.cost_model(scheduled)
+            ready = self._busy_until
+        return _FakeStep(tokens, ready)
+
+    def execute(self, scheduled: list[ScheduledSeq]) -> list[int]:
+        return self.execute_async(scheduled).result()
+
+    def _inputs(self, item: ScheduledSeq) -> list[int]:
+        """The sequence's tokens up to the end of this step's inputs."""
+        seq = item.seq
+        end = item.start + item.num_new_tokens
+        known = seq.token_ids
+        if end <= len(known):
+            return known[:end]
+        if end == len(known) + 1 and seq in self._last_sampled:
+            return [*known, self._last_sampled[seq]]
+        raise RuntimeError(
+            f"{seq.request_id}: input position {end - 1} is neither known to the CPU "
+            "nor a token the previous step sampled"
+        )
+
+
+class _FakeStep:
+    def __init__(self, tokens: list[int], ready_at: float | None) -> None:
+        self.tokens = tokens
+        self.ready_at = ready_at
+
+    def result(self) -> list[int]:
+        if self.ready_at is not None:
+            time.sleep(max(0.0, self.ready_at - time.perf_counter()))
+        return self.tokens
+
+
+class _SeqView:
+    """What a next-token function sees: the sequence with its inputs filled in."""
+
+    def __init__(self, seq: Sequence, token_ids: list[int]) -> None:
+        self.request_id = seq.request_id
+        self.token_ids = token_ids
+        self.num_prompt_tokens = seq.num_prompt_tokens
+
+    @property
+    def num_tokens(self) -> int:
+        return len(self.token_ids)
+
+    @property
+    def num_output_tokens(self) -> int:
+        return len(self.token_ids) - self.num_prompt_tokens
+
+    @property
+    def last_token_id(self) -> int:
+        return self.token_ids[-1]
 
 
 class ByteTokenizer:

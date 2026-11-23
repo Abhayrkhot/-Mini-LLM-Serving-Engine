@@ -13,6 +13,14 @@ Every engine step the scheduler builds one batch under a token budget
    FIFO while budget, ``max_num_seqs`` and free blocks allow. A prompt longer
    than the remaining budget is split across steps (chunked prefill), so one
    long prompt cannot stall every decoding sequence behind it.
+
+Async scheduling: the engine schedules step n+1 before step n's sampled tokens
+reach the CPU. So ``schedule`` commits each step's work up front (it advances
+``num_computed_tokens`` and counts the token about to be sampled as pending),
+and ``update`` later fills in the sampled tokens and checks stop conditions.
+Length limits are known in advance, so a sequence whose pending token ends it
+is not scheduled again. EOS and stop tokens are not: such a sequence gets one
+more step whose token is discarded.
 """
 
 from __future__ import annotations
@@ -30,12 +38,16 @@ from minillm.sequence import FinishReason, Sequence, SequenceStatus
 class ScheduledSeq:
     seq: Sequence
     num_new_tokens: int
+    # First position this step computes. Fixed at scheduling time: the
+    # sequence's own counters move on before the step's results come back.
+    start: int = field(init=False)
     # True when this step computes the sequence's last uncomputed token, so the
-    # model must sample a new token for it. Fixed at scheduling time.
+    # model must sample a new token for it.
     sample: bool = field(init=False)
 
     def __post_init__(self) -> None:
-        self.sample = self.seq.num_computed_tokens + self.num_new_tokens == self.seq.num_tokens
+        self.start = self.seq.num_computed_tokens
+        self.sample = self.start + self.num_new_tokens == self.seq.num_tokens
 
 
 @dataclass
@@ -117,8 +129,13 @@ class Scheduler:
         preempted: list[Sequence] = []
 
         i = 0
+        finishing = 0  # running, but their pending token ends them
         while i < len(self.running) and budget > 0:
             seq = self.running[i]
+            if self._finishes_on_pending(seq):
+                finishing += 1
+                i += 1
+                continue
             n = min(seq.num_tokens - seq.num_computed_tokens, budget)
             while not bm.can_allocate(seq, n):
                 victim = self.running.pop()
@@ -128,14 +145,19 @@ class Scheduler:
                     break
             else:
                 bm.allocate(seq, n)
-                scheduled.append(ScheduledSeq(seq, n))
+                scheduled.append(self._commit(seq, n))
                 budget -= n
                 i += 1
 
         if not preempted:
             now = time.monotonic()
-            while self.waiting and budget > 0 and len(self.running) < self.max_num_seqs:
+            while self.waiting and budget > 0 and len(self.running) - finishing < self.max_num_seqs:
                 seq = self.waiting[0]
+                if seq.num_pending_tokens:
+                    # Preempted while its last step was in flight: recompute it only
+                    # once that token arrives. (Cannot happen while admission is
+                    # skipped in rounds that preempt; the runner relies on it.)
+                    break
                 prefix = bm.find_cached_prefix(seq.token_ids)
                 remaining = seq.num_tokens - len(prefix) * bm.block_size
                 n = min(remaining, budget)
@@ -149,13 +171,29 @@ class Scheduler:
                 if seq.first_scheduled_time is None:
                     seq.first_scheduled_time = now
                 self.running.append(seq)
-                scheduled.append(ScheduledSeq(seq, n))
+                scheduled.append(self._commit(seq, n))
                 budget -= n
 
         return SchedulerOutput(scheduled, preempted)
 
+    @staticmethod
+    def _commit(seq: Sequence, num_new_tokens: int) -> ScheduledSeq:
+        """Record the step's work on the sequence before it runs."""
+        item = ScheduledSeq(seq, num_new_tokens)
+        seq.num_computed_tokens += num_new_tokens
+        if item.sample:
+            seq.num_pending_tokens += 1
+        return item
+
+    def _finishes_on_pending(self, seq: Sequence) -> bool:
+        """True if the token still in flight will end ``seq`` on a length limit."""
+        return seq.num_pending_tokens > 0 and (
+            seq.num_output_tokens + seq.num_pending_tokens >= seq.params.max_tokens
+            or seq.num_tokens >= self.max_model_len
+        )
+
     def update(self, output: SchedulerOutput, sampled: list[int]) -> list[TokenEvent]:
-        """Apply a finished step: advance computed counts and append sampled tokens."""
+        """Apply a finished step: append its sampled tokens and check stop conditions."""
         num_samples = sum(1 for s in output.scheduled if s.sample)
         if len(sampled) != num_samples:
             raise ValueError(f"expected {num_samples} sampled tokens, got {len(sampled)}")
@@ -165,19 +203,27 @@ class Scheduler:
         any_finished = False
         for s in output.scheduled:
             seq = s.seq
-            token = next(tokens) if s.sample else None
-            if seq.is_finished:  # aborted while the step was running
+            if not s.sample:
+                if seq.status is SequenceStatus.RUNNING:
+                    self.block_manager.cache_full_blocks(seq)
                 continue
-            seq.num_computed_tokens += s.num_new_tokens
-            self.block_manager.cache_full_blocks(seq)
-            if token is None:
+            token = next(tokens)
+            seq.num_pending_tokens -= 1
+            if seq.is_finished:
+                # Aborted while the step ran, or (async) stopped on the previous
+                # step's token: this one is the discarded extra.
                 continue
             gap = seq.append_token(token, now)
+            if seq.status is SequenceStatus.RUNNING:  # not preempted meanwhile
+                self.block_manager.cache_full_blocks(seq)
             events.append(TokenEvent(seq, token, gap))
             reason = self._stop_reason(seq)
             if reason is not None:
+                if seq.status is SequenceStatus.WAITING:  # preempted while the step ran
+                    self.waiting.remove(seq)
+                else:
+                    any_finished = True
                 self._finish(seq, reason, now)
-                any_finished = True
         if any_finished:
             self.running = [s for s in self.running if not s.is_finished]
         return events
@@ -189,7 +235,7 @@ class Scheduler:
             return FinishReason.STOP
         if token in params.stop_token_ids:
             return FinishReason.STOP
-        if seq.num_output_tokens >= params.max_tokens or seq.num_tokens >= self.max_model_len:
+        if seq.num_output_tokens >= params.max_tokens or len(seq.token_ids) >= self.max_model_len:
             return FinishReason.LENGTH
         return None
 

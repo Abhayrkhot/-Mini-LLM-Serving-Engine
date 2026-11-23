@@ -7,6 +7,10 @@ import torch
 _GREEDY_EPS = 1e-5
 
 
+def is_greedy(temperature: float) -> bool:
+    return temperature < _GREEDY_EPS
+
+
 @torch.inference_mode()
 def sample(
     logits: torch.Tensor,  # [S, V], float32
@@ -14,18 +18,31 @@ def sample(
     top_p: torch.Tensor,  # [S]
     top_k: torch.Tensor,  # [S] int64, <= 0 disables
     generator: torch.Generator | None = None,
+    *,
+    all_greedy: bool | None = None,
+    needs_filter: bool | None = None,
 ) -> torch.Tensor:
+    """Sample one token per row.
+
+    ``all_greedy`` / ``needs_filter`` let the caller, who has the sampling
+    parameters on the CPU, skip work without a device-to-host sync; when left
+    as None they are read off the device tensors.
+    """
     greedy_tokens = logits.argmax(dim=-1)
-    is_greedy = temperature < _GREEDY_EPS
-    if bool(is_greedy.all()):
+    greedy = temperature < _GREEDY_EPS
+    if all_greedy is None:
+        all_greedy = bool(greedy.all())
+    if all_greedy:
         return greedy_tokens
 
     vocab = logits.shape[-1]
-    t = torch.where(is_greedy, torch.ones_like(temperature), temperature)
+    t = torch.where(greedy, torch.ones_like(temperature), temperature)
     logits = logits / t[:, None]
 
     k = torch.where(top_k > 0, top_k, torch.full_like(top_k, vocab))
-    if bool((k < vocab).any()) or bool((top_p < 1.0).any()):
+    if needs_filter is None:
+        needs_filter = bool((k < vocab).any()) or bool((top_p < 1.0).any())
+    if needs_filter:
         sorted_logits, sorted_idx = logits.sort(dim=-1, descending=True)
         ranks = torch.arange(vocab, device=logits.device)
         drop = ranks[None, :] >= k[:, None]
@@ -40,4 +57,4 @@ def sample(
     # without the device-host sync torch.multinomial needs.
     noise = torch.empty_like(probs).exponential_(generator=generator).clamp_(min=1e-20)
     sampled = (probs / noise).argmax(dim=-1)
-    return torch.where(is_greedy, greedy_tokens, sampled)
+    return torch.where(greedy, greedy_tokens, sampled)

@@ -173,6 +173,41 @@ def flash_attention(
     )  # fmt: skip
 
 
+def paged_kv_layout(
+    block_tables: list[list[int]],
+    seq_lens: list[int],
+    block_size: int,
+    pad_rows: int = 0,
+    pad_block: int = 0,
+) -> tuple[list[int], list[int], list[int]]:
+    """FlashInfer's CSR view of the batch's pages: (indptr, indices, last_page_len).
+
+    ``pad_rows`` extra one-page sequences over ``pad_block`` fill a CUDA-graph batch.
+    """
+    indptr, indices, last = [0], [], []
+    for table, seq_len in zip(block_tables, seq_lens, strict=True):
+        pages = cdiv(seq_len, block_size)
+        indices.extend(table[:pages])
+        indptr.append(indptr[-1] + pages)
+        last.append(seq_len - (pages - 1) * block_size)
+    for _ in range(pad_rows):
+        indices.append(pad_block)
+        indptr.append(indptr[-1] + 1)
+        last.append(1)
+    return indptr, indices, last
+
+
+def pinned_views(parts: list[list[int]], dtype: torch.dtype, pin: bool) -> list[torch.Tensor]:
+    """Pack lists into one (pinned) host tensor; return a view per list."""
+    flat = [x for part in parts for x in part]
+    host = torch.tensor(flat, dtype=dtype, pin_memory=pin)
+    views, offset = [], 0
+    for part in parts:
+        views.append(host[offset : offset + len(part)])
+        offset += len(part)
+    return views
+
+
 def flashinfer_attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -198,6 +233,11 @@ class FlashInferPlanner:
     Decode-only steps get the decode kernel (tensor cores, for grouped-query
     heads); anything with a prompt chunk gets the prefill kernel, whose causal
     mask is aligned to the end of each sequence like ours.
+
+    Planning must not block on the GPU, or async scheduling stalls: every host
+    tensor handed to ``plan`` is pinned (so its copy is asynchronous), and a
+    CUDA-graph wrapper gets its page indices already on the device (from host
+    memory it copies them synchronously).
     """
 
     def __init__(
@@ -222,29 +262,40 @@ class FlashInferPlanner:
         self.decode = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
             self.workspace, "NHD", use_tensor_cores=True
         )
+        self.shape = (num_heads, num_kv_heads, head_dim, block_size)
+        self.kwargs = dict(sm_scale=head_dim**-0.5, q_data_type=dtype, kv_data_type=dtype)
+        self._planned: dict[int, torch.cuda.Event] = {}
+
+    def run_plan(self, wrapper: Any, *args: Any, **kwargs: Any) -> None:
+        """``wrapper.plan``, safe to call while earlier steps still run.
+
+        ``plan`` writes its work schedule into a pinned host buffer and queues a
+        copy to the GPU. Re-planning the same wrapper before that copy ran would
+        overwrite the buffer under it, so wait for the previous one first. That
+        copy is queued ahead of the step that used it, behind work the engine has
+        already waited for, so in practice this never blocks.
+        """
+        done = self._planned.get(id(wrapper))
+        if done is None:
+            done = self._planned[id(wrapper)] = torch.cuda.Event()
+        else:
+            done.synchronize()
+        wrapper.plan(*args, **kwargs)
+        done.record()
 
     def plan(
         self, block_tables: list[list[int]], seq_lens: list[int], query_lens: list[int]
     ) -> Any:
-        bs = self.block_size
-        indptr, indices, last_page_len, qo_indptr = [0], [], [], [0]
-        for table, seq_len, q_len in zip(block_tables, seq_lens, query_lens, strict=True):
-            pages = cdiv(seq_len, bs)
-            indices.extend(table[:pages])
-            indptr.append(indptr[-1] + pages)
-            last_page_len.append(seq_len - (pages - 1) * bs)
+        indptr, indices, last = paged_kv_layout(block_tables, seq_lens, self.block_size)
+        qo_indptr = [0]
+        for q_len in query_lens:
             qo_indptr.append(qo_indptr[-1] + q_len)
-
-        def i32(xs: list[int]) -> torch.Tensor:  # host tensors: plan() copies them over itself
-            return torch.tensor(xs, dtype=torch.int32)
-
-        args = (i32(indptr), i32(indices), i32(last_page_len))
-        shape = (self.num_heads, self.num_kv_heads, self.head_dim, bs)
-        kwargs = dict(sm_scale=self.head_dim**-0.5, q_data_type=self.dtype, kv_data_type=self.dtype)
         if max(query_lens) == 1:
-            self.decode.plan(*args, *shape, **kwargs)
+            args = pinned_views([indptr, indices, last], torch.int32, pin=True)
+            self.run_plan(self.decode, *args, *self.shape, **self.kwargs)
             return self.decode
-        self.prefill.plan(i32(qo_indptr), *args, *shape, causal=True, **kwargs)
+        args = pinned_views([qo_indptr, indptr, indices, last], torch.int32, pin=True)
+        self.run_plan(self.prefill, *args, *self.shape, causal=True, **self.kwargs)
         return self.prefill
 
 
