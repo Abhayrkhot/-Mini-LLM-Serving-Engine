@@ -17,7 +17,7 @@ class EngineConfig:
     dtype: str = "auto"
     """``auto``: bfloat16 on cuda/mps, float32 on cpu. Or float16, bfloat16, float32."""
     attention_backend: str = "auto"
-    """``auto`` uses flash_attn on CUDA when installed, otherwise the torch backend."""
+    """``auto``: on CUDA, flashinfer, then flash_attn, whichever loads; otherwise torch."""
 
     block_size: int | None = None
     """Tokens per KV block. Default 256 for flash_attn (its paged kernels require it), else 16."""
@@ -37,6 +37,9 @@ class EngineConfig:
     num_kv_blocks: int | None = None
     """Override the KV-cache size in blocks (skips memory profiling)."""
 
+    enforce_eager: bool = False
+    """Disable decode CUDA graphs (used with the flashinfer backend on CUDA)."""
+
     seed: int = 0
 
     def __post_init__(self) -> None:
@@ -46,5 +49,5 @@ class EngineConfig:
             raise ValueError("max_num_seqs and max_num_batched_tokens must be >= 1")
         if self.block_size is not None and self.block_size < 1:
             raise ValueError("block_size must be >= 1")
-        if self.attention_backend not in ("auto", "torch", "flash_attn"):
-            raise ValueError("attention_backend must be auto, torch or flash_attn")
+        if self.attention_backend not in ("auto", "torch", "flash_attn", "flashinfer"):
+            raise ValueError("attention_backend must be auto, torch, flash_attn or flashinfer")

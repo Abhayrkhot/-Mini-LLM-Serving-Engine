@@ -8,12 +8,14 @@ is ``1 < query_len < seq_len_k``. One code path handles both, so prefill
 chunks and decodes can share a batch.
 
 Cache layout per layer: ``[num_blocks, block_size, num_kv_heads, head_dim]``,
-the layout flash-attn's paged kernels expect.
+the layout both flash-attn's and FlashInfer's paged kernels read ("NHD").
 
 Backends:
   * ``torch``: gathers each sequence's blocks and calls SDPA with an explicit
     mask. Runs on CPU, MPS and CUDA; it is the reference implementation the
     tests check against dense attention.
+  * ``flashinfer``: FlashInfer's paged prefill and decode kernels (CUDA). They
+    read blocks in place through the block table; planned once per step.
   * ``flash_attn``: flash-attn 2 varlen and kv-cache kernels with block tables
     (CUDA only, block_size must be a multiple of 256).
 """
@@ -22,6 +24,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import cached_property
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -43,6 +46,7 @@ class AttentionMetadata:
     slot_mapping: torch.Tensor | None  # int64 [T]: flat cache slot for each new token
     block_tables: torch.Tensor | None  # int32 [B, max_blocks]; None = no cache (profiling run)
     decode_only: bool
+    flashinfer: Any = None  # a planned FlashInfer wrapper, shared by every layer this step
 
     @cached_property
     def token_to_seq(self) -> torch.Tensor:
@@ -169,7 +173,86 @@ def flash_attention(
     )  # fmt: skip
 
 
-_BACKENDS = {"torch": torch_attention, "flash_attn": flash_attention}
+def flashinfer_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k_cache: torch.Tensor | None,
+    v_cache: torch.Tensor | None,
+    meta: AttentionMetadata,
+    scale: float,
+) -> torch.Tensor:
+    if meta.block_tables is None:  # memory-profiling run before the cache exists
+        return torch_attention(q, k, v, None, None, meta, scale)
+    if meta.flashinfer is None:
+        raise RuntimeError("flashinfer backend needs a planned wrapper in the metadata")
+    out: torch.Tensor = meta.flashinfer.run(q, (k_cache, v_cache))
+    return out
+
+
+class FlashInferPlanner:
+    """Owns FlashInfer's workspace and wrappers.
+
+    FlashInfer splits work in a CPU-side ``plan`` step that depends only on the
+    batch shape, so the engine plans once per step and every layer reuses it.
+    Decode-only steps get the decode kernel (tensor cores, for grouped-query
+    heads); anything with a prompt chunk gets the prefill kernel, whose causal
+    mask is aligned to the end of each sequence like ours.
+    """
+
+    def __init__(
+        self,
+        device: torch.device,
+        num_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        block_size: int,
+        dtype: torch.dtype,
+        workspace_mb: int = 256,
+    ) -> None:
+        import flashinfer
+
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+        self.block_size = block_size
+        self.dtype = dtype
+        self.workspace = torch.zeros(workspace_mb * 2**20, dtype=torch.uint8, device=device)
+        self.prefill = flashinfer.BatchPrefillWithPagedKVCacheWrapper(self.workspace, "NHD")
+        self.decode = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+            self.workspace, "NHD", use_tensor_cores=True
+        )
+
+    def plan(
+        self, block_tables: list[list[int]], seq_lens: list[int], query_lens: list[int]
+    ) -> Any:
+        bs = self.block_size
+        indptr, indices, last_page_len, qo_indptr = [0], [], [], [0]
+        for table, seq_len, q_len in zip(block_tables, seq_lens, query_lens, strict=True):
+            pages = cdiv(seq_len, bs)
+            indices.extend(table[:pages])
+            indptr.append(indptr[-1] + pages)
+            last_page_len.append(seq_len - (pages - 1) * bs)
+            qo_indptr.append(qo_indptr[-1] + q_len)
+
+        def i32(xs: list[int]) -> torch.Tensor:  # host tensors: plan() copies them over itself
+            return torch.tensor(xs, dtype=torch.int32)
+
+        args = (i32(indptr), i32(indices), i32(last_page_len))
+        shape = (self.num_heads, self.num_kv_heads, self.head_dim, bs)
+        kwargs = dict(sm_scale=self.head_dim**-0.5, q_data_type=self.dtype, kv_data_type=self.dtype)
+        if max(query_lens) == 1:
+            self.decode.plan(*args, *shape, **kwargs)
+            return self.decode
+        self.prefill.plan(i32(qo_indptr), *args, *shape, causal=True, **kwargs)
+        return self.prefill
+
+
+_BACKENDS = {
+    "torch": torch_attention,
+    "flash_attn": flash_attention,
+    "flashinfer": flashinfer_attention,
+}
 
 
 class PagedAttention(nn.Module):

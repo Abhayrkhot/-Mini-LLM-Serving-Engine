@@ -39,7 +39,7 @@ NEAR_TIE = 1e-3
 
 
 def test_greedy_tokens_are_hf_argmax() -> None:
-    from transformers import AutoModelForCausalLM
+    from tests.conftest import load_hf_model
 
     assert MODEL is not None
     device = os.environ.get("MINILLM_TEST_DEVICE", "cpu")
@@ -56,7 +56,7 @@ def test_greedy_tokens_are_hf_argmax() -> None:
     params = SamplingParams(max_tokens=48, temperature=0.0, ignore_eos=True)
     results = engine.generate(PROMPTS, params)
 
-    hf = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.float32).to(device).eval()
+    hf = load_hf_model(MODEL, torch.float32).to(device)
     checked = 0
     for res in results:
         full = res.prompt_token_ids + res.output_token_ids
@@ -71,3 +71,46 @@ def test_greedy_tokens_are_hf_argmax() -> None:
                 assert gap < NEAR_TIE, f"step {t} of {res.text!r}: logit gap {gap:.2e}"
             checked += 1
     assert checked == len(PROMPTS) * 48
+
+
+@pytest.mark.parametrize("backend", ["flashinfer", "flash_attn"])
+def test_gpu_backend_matches_hf_in_bf16(backend: str) -> None:
+    """The fast CUDA kernels in bfloat16, teacher-forced against HF in bfloat16."""
+    from minillm.executor.model_runner import _importable
+    from tests.conftest import load_hf_model
+
+    if not torch.cuda.is_available() or not _importable(backend):
+        pytest.skip(f"needs CUDA and {backend}")
+    assert MODEL is not None
+    engine = LLMEngine(
+        EngineConfig(
+            model=MODEL,
+            device="cuda",
+            dtype="bfloat16",
+            attention_backend=backend,
+            max_model_len=1024,
+            max_num_batched_tokens=24,
+        )
+    )
+    results = engine.generate(
+        PROMPTS, SamplingParams(max_tokens=48, temperature=0.0, ignore_eos=True)
+    )
+    hf = load_hf_model(MODEL, torch.bfloat16).to("cuda")
+    total = agree = 0
+    worst = 0.0
+    for res in results:
+        full = res.prompt_token_ids + res.output_token_ids
+        with torch.inference_mode():
+            logits = hf(torch.tensor([full], device="cuda")).logits[0].float()
+        start = len(res.prompt_token_ids) - 1
+        for t, token in enumerate(res.output_token_ids):
+            row = logits[start + t]
+            best = int(row.argmax())
+            total += 1
+            if best == token:
+                agree += 1
+            else:
+                worst = max(worst, float(row[best] - row[token]))
+    # bf16 kernels round differently from HF's SDPA, so only near-ties may flip.
+    assert agree / total > 0.97, f"{agree}/{total} agree"
+    assert worst < 0.5, f"largest logit gap at a disagreement: {worst:.3f}"

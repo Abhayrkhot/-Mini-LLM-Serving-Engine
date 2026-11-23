@@ -351,7 +351,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--port", type=int, default=8000)
     p.add_argument("--device", default="auto")
     p.add_argument("--dtype", default="auto", choices=["auto", "float16", "bfloat16", "float32"])
-    p.add_argument("--attention-backend", default="auto", choices=["auto", "torch", "flash_attn"])
+    p.add_argument(
+        "--attention-backend", default="auto", choices=["auto", "torch", "flash_attn", "flashinfer"]
+    )
     p.add_argument("--block-size", type=int, default=None)
     p.add_argument("--max-model-len", type=int, default=None)
     p.add_argument("--max-num-seqs", type=int, default=128)
@@ -361,6 +363,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--gpu-memory-utilization", type=float, default=0.90)
     p.add_argument("--kv-cache-memory-gb", type=float, default=1.0)
     p.add_argument("--num-kv-blocks", type=int, default=None)
+    p.add_argument("--enforce-eager", action="store_true", help="disable decode CUDA graphs")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--max-pending-requests", type=int, default=1024)
     p.add_argument("--log-level", default="info", choices=["debug", "info", "warning", "error"])
@@ -388,6 +391,7 @@ def main(argv: list[str] | None = None) -> None:
         gpu_memory_utilization=args.gpu_memory_utilization,
         kv_cache_memory_gb=args.kv_cache_memory_gb,
         num_kv_blocks=args.num_kv_blocks,
+        enforce_eager=args.enforce_eager,
         seed=args.seed,
     )
     metrics = EngineMetrics()

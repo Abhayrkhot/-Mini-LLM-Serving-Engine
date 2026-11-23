@@ -23,14 +23,7 @@ TINY = dict(
 
 
 def _tiny_models() -> dict[str, tuple[Any, Any]]:
-    from transformers import (
-        LlamaConfig,
-        LlamaForCausalLM,
-        Qwen2Config,
-        Qwen2ForCausalLM,
-        Qwen3Config,
-        Qwen3ForCausalLM,
-    )
+    from transformers import LlamaConfig, LlamaForCausalLM, Qwen2Config, Qwen2ForCausalLM
 
     llama3_rope = {
         "rope_type": "llama3",
@@ -39,11 +32,29 @@ def _tiny_models() -> dict[str, tuple[Any, Any]]:
         "high_freq_factor": 4.0,
         "original_max_position_embeddings": 32,
     }
-    return {
+    models: dict[str, tuple[Any, Any]] = {
         "qwen2": (Qwen2Config(**TINY, tie_word_embeddings=True), Qwen2ForCausalLM),
-        "qwen3": (Qwen3Config(**TINY, head_dim=16), Qwen3ForCausalLM),
         "llama3": (LlamaConfig(**TINY, rope_scaling=llama3_rope), LlamaForCausalLM),
     }
+    try:  # Qwen3 arrived in transformers 4.51; older installs (e.g. vLLM images) skip it.
+        from transformers import Qwen3Config, Qwen3ForCausalLM
+
+        models["qwen3"] = (Qwen3Config(**TINY, head_dim=16), Qwen3ForCausalLM)
+    except ImportError:
+        pass
+    return models
+
+
+TINY_MODEL_NAMES = sorted(_tiny_models())
+
+
+def load_hf_model(path: Any, dtype: torch.dtype) -> Any:
+    """AutoModelForCausalLM.from_pretrained across transformers 4.x (torch_dtype) and 5.x (dtype)."""
+    import transformers
+    from transformers import AutoModelForCausalLM
+
+    key = "dtype" if int(transformers.__version__.split(".")[0]) >= 5 else "torch_dtype"
+    return AutoModelForCausalLM.from_pretrained(path, **{key: dtype}).eval()
 
 
 @pytest.fixture(scope="session")
@@ -62,12 +73,7 @@ def tiny_model_dirs(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Path]
 
 @pytest.fixture(scope="session")
 def hf_models(tiny_model_dirs: dict[str, Path]) -> dict[str, Any]:
-    from transformers import AutoModelForCausalLM
-
-    return {
-        name: AutoModelForCausalLM.from_pretrained(path, dtype=torch.float32).eval()
-        for name, path in tiny_model_dirs.items()
-    }
+    return {name: load_hf_model(path, torch.float32) for name, path in tiny_model_dirs.items()}
 
 
 def hf_greedy(model: Any, prompt: list[int], max_tokens: int) -> list[int]:

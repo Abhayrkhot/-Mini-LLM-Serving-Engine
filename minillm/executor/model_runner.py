@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import importlib.util
+import importlib
 import logging
 import os
 import time
@@ -10,7 +10,8 @@ import time
 import torch
 
 from minillm.config import EngineConfig
-from minillm.layers.attention import AttentionMetadata
+from minillm.executor.cuda_graphs import DecodeGraphs
+from minillm.layers.attention import AttentionMetadata, FlashInferPlanner
 from minillm.layers.sampler import sample
 from minillm.models.llama import ModelConfig
 from minillm.models.loader import (
@@ -50,13 +51,28 @@ def resolve_dtype(name: str, device: torch.device) -> torch.dtype:
     return torch.float32
 
 
+def _importable(module: str) -> bool:
+    # A real import, not find_spec: a flash-attn wheel built for a different
+    # torch is "found" but fails to load its CUDA extension.
+    try:
+        importlib.import_module(module)
+    except Exception:
+        return False
+    return True
+
+
 def resolve_backend(name: str, device: torch.device) -> str:
-    has_flash = importlib.util.find_spec("flash_attn") is not None
+    # Preference order for "auto": FlashInfer is the backend verified on H200 hardware.
+    gpu_backends = {"flashinfer": "flashinfer", "flash_attn": "flash_attn"}
     if name == "auto":
-        return "flash_attn" if device.type == "cuda" and has_flash else "torch"
-    if name == "flash_attn" and (device.type != "cuda" or not has_flash):
+        if device.type == "cuda":
+            for backend, module in gpu_backends.items():
+                if _importable(module):
+                    return backend
+        return "torch"
+    if name in gpu_backends and (device.type != "cuda" or not _importable(gpu_backends[name])):
         raise ValueError(
-            "attention_backend=flash_attn needs a CUDA device and the flash-attn package"
+            f"attention_backend={name} needs a CUDA device and a working {name} install"
         )
     return name
 
@@ -83,6 +99,12 @@ class ModelRunner:
         self.eos_token_ids = read_eos_token_ids(self.model_dir, hf_config)
         self._pin = self.device.type == "cuda"
 
+        self.flashinfer: FlashInferPlanner | None = None
+        if self.backend == "flashinfer":
+            self.flashinfer = FlashInferPlanner(
+                self.device, mc.num_heads, mc.num_kv_heads, mc.head_dim, self.block_size, self.dtype
+            )
+
         torch.manual_seed(config.seed)
         start = time.perf_counter()
         self.model = build_model(mc, self.device, self.dtype)
@@ -102,6 +124,11 @@ class ModelRunner:
         self.generator = torch.Generator(device=self.device)
         self.generator.manual_seed(config.seed)
         self.num_kv_blocks = self._init_kv_cache()
+
+        # Decode CUDA graphs: CUDA + FlashInfer only (its decode kernel supports capture).
+        self.graphs: DecodeGraphs | None = None
+        if self.backend == "flashinfer" and not config.enforce_eager:
+            self.graphs = DecodeGraphs(self, min(config.max_num_seqs, 512), self.scratch_block)
 
     # ------------------------------------------------------------------ KV cache
 
@@ -142,10 +169,13 @@ class ModelRunner:
 
         # Zeroed, not empty: the torch backend reads masked padding slots, and a
         # masked weight of 0 times a NaN from uninitialised memory is still NaN.
+        # One extra block past the block manager's range is scratch space that
+        # padded rows of a CUDA-graph batch write into.
+        self.scratch_block = num_blocks
         kv = torch.zeros(
             2,
             mc.num_layers,
-            num_blocks,
+            num_blocks + 1,
             self.block_size,
             mc.num_kv_heads,
             mc.head_dim,
@@ -281,11 +311,36 @@ class ModelRunner:
                 top_ps.append(seq.params.top_p)
                 top_ks.append(seq.params.top_k)
 
+        if self.graphs is not None and max(query_lens) == 1 and self.graphs.can_run(len(scheduled)):
+            hidden = self.graphs.run(input_ids, positions, slots, tables, seq_lens)
+        else:
+            hidden = self._eager_forward(
+                input_ids, positions, slots, tables, query_lens, seq_lens, cu_q, cu_k
+            )
+        temps_t = self._tensor(temps, torch.float32)
+        top_ps_t = self._tensor(top_ps, torch.float32)
+        top_ks_t = self._tensor(top_ks, torch.long)
+        if not sample_idx:
+            return None, temps_t, top_ps_t, top_ks_t
+        logits = self.model.compute_logits(hidden[self._tensor(sample_idx, torch.long)]).float()
+        return logits, temps_t, top_ps_t, top_ks_t
+
+    def _eager_forward(
+        self,
+        input_ids: list[int],
+        positions: list[int],
+        slots: list[int],
+        tables: list[list[int]],
+        query_lens: list[int],
+        seq_lens: list[int],
+        cu_q: list[int],
+        cu_k: list[int],
+    ) -> torch.Tensor:
         width = max(len(t) for t in tables)
         padded = [t + [0] * (width - len(t)) for t in tables]
         meta = AttentionMetadata(
             backend=self.backend,
-            num_seqs=len(scheduled),
+            num_seqs=len(tables),
             max_seqlen_q=max(query_lens),
             max_seqlen_k=max(seq_lens),
             query_lens=self._tensor(query_lens, torch.int32),
@@ -298,13 +353,9 @@ class ModelRunner:
             ),
             decode_only=max(query_lens) == 1,
         )
-        hidden = self.model(
+        if self.flashinfer is not None:
+            meta.flashinfer = self.flashinfer.plan(tables, seq_lens, query_lens)
+        hidden: torch.Tensor = self.model(
             self._tensor(input_ids, torch.long), self._tensor(positions, torch.long), meta
         )
-        temps_t = self._tensor(temps, torch.float32)
-        top_ps_t = self._tensor(top_ps, torch.float32)
-        top_ks_t = self._tensor(top_ks, torch.long)
-        if not sample_idx:
-            return None, temps_t, top_ps_t, top_ks_t
-        logits = self.model.compute_logits(hidden[self._tensor(sample_idx, torch.long)]).float()
-        return logits, temps_t, top_ps_t, top_ks_t
+        return hidden

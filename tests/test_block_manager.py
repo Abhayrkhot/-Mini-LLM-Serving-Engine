@@ -210,3 +210,15 @@ TestBlockManagerStateful = BlockManagerMachine.TestCase
 TestBlockManagerStateful.settings = settings(
     max_examples=300, stateful_step_count=60, deadline=None
 )
+
+
+def test_reset_prefix_cache_forgets_only_unreferenced_blocks():
+    bm = BlockManager(num_blocks=16, block_size=4, watermark=0)
+    live = make_seq(list(range(1, 10)), "live")
+    compute(bm, live, 9)
+    done = make_seq(list(range(50, 59)), "done")
+    compute(bm, done, 9)
+    bm.free(done)
+    bm.reset_prefix_cache()
+    assert bm.find_cached_prefix([*range(50, 59), 0]) == []
+    assert bm.find_cached_prefix([*range(1, 10), 0]) == live.block_table[:2]
