@@ -1,0 +1,89 @@
+{
+  "model": "Qwen/Qwen2.5-0.5B-Instruct",
+  "args": {
+    "model": "Qwen/Qwen2.5-0.5B-Instruct",
+    "engine": "minillm",
+    "draft": [
+      0,
+      4
+    ],
+    "concurrency": [
+      1,
+      8,
+      32
+    ],
+    "num_prompts": 64,
+    "passage_tokens": 256,
+    "dtype": "float32",
+    "attention_backend": "torch",
+    "output": "/scratch/khot.ab/minillm/results/spec/minillm_0.5b_fp32.json"
+  },
+  "rows": [
+    {
+      "engine": "minillm",
+      "draft": 0,
+      "concurrency": 1,
+      "output_tokens": 10709,
+      "output_throughput": 77.96610540400931,
+      "mean_tpot_ms": 12.743413781504069,
+      "acceptance": null,
+      "tokens_per_step_gain": 0.0,
+      "same_as_no_draft": 1.0
+    },
+    {
+      "engine": "minillm",
+      "draft": 0,
+      "concurrency": 8,
+      "output_tokens": 10709,
+      "output_throughput": 536.1541774132976,
+      "mean_tpot_ms": 13.445133235448049,
+      "acceptance": null,
+      "tokens_per_step_gain": 0.0,
+      "same_as_no_draft": 1.0
+    },
+    {
+      "engine": "minillm",
+      "draft": 0,
+      "concurrency": 32,
+      "output_tokens": 10709,
+      "output_throughput": 1358.520834096211,
+      "mean_tpot_ms": 15.970289508821432,
+      "acceptance": null,
+      "tokens_per_step_gain": 0.0,
+      "same_as_no_draft": 1.0
+    },
+    {
+      "engine": "minillm",
+      "draft": 4,
+      "concurrency": 1,
+      "output_tokens": 10709,
+      "output_throughput": 259.5547762735927,
+      "mean_tpot_ms": 4.265378163234309,
+      "acceptance": 0.6608945353289245,
+      "tokens_per_step_gain": 2.438985228002569,
+      "same_as_no_draft": 1.0
+    },
+    {
+      "engine": "minillm",
+      "draft": 4,
+      "concurrency": 8,
+      "output_tokens": 10709,
+      "output_throughput": 1582.7574218731643,
+      "mean_tpot_ms": 4.945129280378055,
+      "acceptance": 0.6608945353289245,
+      "tokens_per_step_gain": 2.438985228002569,
+      "same_as_no_draft": 1.0
+    },
+    {
+      "engine": "minillm",
+      "draft": 4,
+      "concurrency": 32,
+      "output_tokens": 10709,
+      "output_throughput": 3474.1001614811057,
+      "mean_tpot_ms": 7.115117550481734,
+      "acceptance": 0.6608945353289245,
+      "tokens_per_step_gain": 2.438985228002569,
+      "same_as_no_draft": 1.0
+    }
+  ]
+}
