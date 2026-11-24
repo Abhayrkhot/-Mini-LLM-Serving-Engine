@@ -1,0 +1,52 @@
+{
+  "model": "Qwen/Qwen2.5-7B-Instruct",
+  "args": {
+    "model": "Qwen/Qwen2.5-7B-Instruct",
+    "engine": "vllm",
+    "draft": [
+      0,
+      4
+    ],
+    "concurrency": [
+      1,
+      32
+    ],
+    "num_prompts": 64,
+    "passage_tokens": 256,
+    "output": "/scratch/khot.ab/minillm/results/spec/vllm_7b.json"
+  },
+  "rows": [
+    {
+      "engine": "vllm",
+      "draft": 0,
+      "concurrency": 1,
+      "output_tokens": 16337,
+      "output_throughput": 214.12249915223632,
+      "same_as_no_draft": 1.0
+    },
+    {
+      "engine": "vllm",
+      "draft": 0,
+      "concurrency": 32,
+      "output_tokens": 16337,
+      "output_throughput": 5406.414949778109,
+      "same_as_no_draft": 1.0
+    },
+    {
+      "engine": "vllm",
+      "draft": 4,
+      "concurrency": 1,
+      "output_tokens": 16337,
+      "output_throughput": 843.9599590495898,
+      "same_as_no_draft": 1.0
+    },
+    {
+      "engine": "vllm",
+      "draft": 4,
+      "concurrency": 32,
+      "output_tokens": 16337,
+      "output_throughput": 12069.424401967686,
+      "same_as_no_draft": 1.0
+    }
+  ]
+}

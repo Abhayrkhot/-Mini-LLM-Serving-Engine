@@ -1,0 +1,87 @@
+{
+  "model": "Qwen/Qwen2.5-0.5B-Instruct",
+  "args": {
+    "model": "Qwen/Qwen2.5-0.5B-Instruct",
+    "engine": "minillm",
+    "draft": [
+      0,
+      4
+    ],
+    "concurrency": [
+      1,
+      8,
+      32
+    ],
+    "num_prompts": 64,
+    "passage_tokens": 256,
+    "output": "/scratch/khot.ab/minillm/results/spec/minillm_0.5b.json"
+  },
+  "rows": [
+    {
+      "engine": "minillm",
+      "draft": 0,
+      "concurrency": 1,
+      "output_tokens": 10820,
+      "output_throughput": 896.6901013236665,
+      "mean_tpot_ms": 1.0836510040413296,
+      "acceptance": null,
+      "tokens_per_step_gain": 0.0,
+      "same_as_no_draft": 1.0
+    },
+    {
+      "engine": "minillm",
+      "draft": 0,
+      "concurrency": 8,
+      "output_tokens": 10454,
+      "output_throughput": 5308.583071701929,
+      "mean_tpot_ms": 1.367184882614945,
+      "acceptance": null,
+      "tokens_per_step_gain": 0.0,
+      "same_as_no_draft": 1.0
+    },
+    {
+      "engine": "minillm",
+      "draft": 0,
+      "concurrency": 32,
+      "output_tokens": 11039,
+      "output_throughput": 13235.986650938852,
+      "mean_tpot_ms": 1.6759071514413884,
+      "acceptance": null,
+      "tokens_per_step_gain": 0.0,
+      "same_as_no_draft": 1.0
+    },
+    {
+      "engine": "minillm",
+      "draft": 4,
+      "concurrency": 1,
+      "output_tokens": 10523,
+      "output_throughput": 723.9136513645424,
+      "mean_tpot_ms": 1.4981321080249557,
+      "acceptance": 0.6538461538461539,
+      "tokens_per_step_gain": 2.401098901098901,
+      "same_as_no_draft": 0.84375
+    },
+    {
+      "engine": "minillm",
+      "draft": 4,
+      "concurrency": 8,
+      "output_tokens": 10715,
+      "output_throughput": 4570.3289035358775,
+      "mean_tpot_ms": 1.8772040850060132,
+      "acceptance": 0.6563258232235701,
+      "tokens_per_step_gain": 2.4113339700732253,
+      "same_as_no_draft": 0.859375
+    },
+    {
+      "engine": "minillm",
+      "draft": 4,
+      "concurrency": 32,
+      "output_tokens": 10784,
+      "output_throughput": 8230.54573061335,
+      "mean_tpot_ms": 2.80277495953757,
+      "acceptance": 0.6519801131493228,
+      "tokens_per_step_gain": 2.39332913782253,
+      "same_as_no_draft": 0.90625
+    }
+  ]
+}

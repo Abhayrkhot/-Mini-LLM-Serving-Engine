@@ -68,6 +68,8 @@ def run_minillm(args: argparse.Namespace, ps: list[list[int]]) -> list[dict[str,
                 max_num_seqs=max(args.concurrency),
                 max_num_batched_tokens=8192,
                 speculative_tokens=draft,
+                **({"dtype": args.dtype} if args.dtype else {}),
+                **({"attention_backend": args.attention_backend} if args.attention_backend else {}),
             )
         )
         engine.generate(ps[:4], params)  # warm-up
@@ -164,6 +166,8 @@ def main() -> None:
     p.add_argument("--concurrency", type=int, nargs="+", default=[1, 8, 32])
     p.add_argument("--num-prompts", type=int, default=64)
     p.add_argument("--passage-tokens", type=int, default=256)
+    p.add_argument("--dtype", default=None, help="minillm only, e.g. float32")
+    p.add_argument("--attention-backend", default=None, help="minillm only, e.g. torch")
     p.add_argument("--output", default=None)
     args = p.parse_args()
     from transformers import AutoTokenizer
