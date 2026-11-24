@@ -50,8 +50,8 @@ def prompts(tokenizer: Any, args: argparse.Namespace) -> list[list[int]]:
                 + passage,
             }
         ]
-        ids = tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=True)
-        out.append(list(ids["input_ids"] if isinstance(ids, dict) else ids))
+        text = tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+        out.append(tokenizer.encode(text, add_special_tokens=False))
     return out
 
 
