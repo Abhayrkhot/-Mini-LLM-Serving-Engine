@@ -128,6 +128,27 @@ def test_block_table_rows_are_reused_correctly(tiny_model_dirs, hf_models):
     assert [r.output_token_ids for r in results] == expected
 
 
+@pytest.mark.parametrize("name", MODELS)
+def test_speculative_decoding_matches_hf(name, tiny_model_dirs, hf_models):
+    """N-gram drafts verified in one step: every accepted token, every correction,
+    and the rolled-back positions of rejected drafts must leave the output exactly
+    HF's. Repetitive prompts make drafts likely; a tight cache adds preemption."""
+    rng = random.Random(11)
+    prompts = []
+    for _ in range(5):
+        motif = [rng.randrange(3, 256) for _ in range(rng.randint(2, 5))]
+        prompts.append((motif * 8)[: rng.randint(12, 30)])
+    engine = _engine(
+        tiny_model_dirs[name], speculative_tokens=4, num_kv_blocks=24, max_num_batched_tokens=16
+    )
+    results = engine.generate(prompts, GREEDY)
+    for prompt, res in zip(prompts, results, strict=True):
+        assert res.output_token_ids == hf_greedy(hf_models[name], prompt, 20)
+    sched = engine.scheduler
+    assert 0 < sched.spec_accepted < sched.spec_drafted  # both paths ran
+    assert sched.num_preemptions > 0
+
+
 def test_stale_nan_in_cache_does_not_leak(tiny_model_dirs, hf_models):
     # Poison every cache slot: anything read without being written first would
     # turn the output into NaN (argmax 0). Correct paged attention never reads it.

@@ -42,6 +42,8 @@ class EngineStats:
     preemptions: int = 0
     prefix_cache_queries: int = 0
     prefix_cache_hits: int = 0
+    spec_draft_tokens: int = 0
+    spec_accepted_tokens: int = 0
     time_to_first_token: list[float] = field(default_factory=list)
     inter_token_latency: list[float] = field(default_factory=list)
     finished: list[FinishedRequest] = field(default_factory=list)
@@ -123,6 +125,14 @@ class EngineMetrics:
         self.prefix_cache_hits = Counter(
             "minillm_prefix_cache_hits", "Prompt tokens served from the prefix cache.", registry=r
         )
+        self.spec_draft_tokens = Counter(
+            "minillm_spec_draft_tokens", "Speculative tokens drafted.", registry=r
+        )
+        self.spec_accepted_tokens = Counter(
+            "minillm_spec_accepted_tokens",
+            "Speculative tokens the model agreed with.",
+            registry=r,
+        )
         self.num_running = Gauge("minillm_num_requests_running", "Running sequences.", registry=r)
         self.num_waiting = Gauge("minillm_num_requests_waiting", "Queued sequences.", registry=r)
         self.kv_cache_usage = Gauge(
@@ -142,6 +152,8 @@ class EngineMetrics:
         self.preemptions.inc(stats.preemptions)
         self.prefix_cache_queries.inc(stats.prefix_cache_queries)
         self.prefix_cache_hits.inc(stats.prefix_cache_hits)
+        self.spec_draft_tokens.inc(stats.spec_draft_tokens)
+        self.spec_accepted_tokens.inc(stats.spec_accepted_tokens)
         for f in stats.finished:
             self.requests_finished.labels(f.finish_reason).inc()
             self.prompt_tokens.inc(f.prompt_tokens)

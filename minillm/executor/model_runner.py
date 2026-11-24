@@ -349,6 +349,7 @@ class ModelRunner:
             return DoneStep([])
         tokens = self._sample(hidden, batch)
         self._prev_tokens = tokens
+        # (Speculative steps never run ahead, so their extra rows are not needed here.)
         self._prev_rows = {seq: row for row, seq in enumerate(batch.sampling)}
         return self._to_host(tokens)
 
@@ -385,7 +386,10 @@ class ModelRunner:
             start = item.start
             end = start + item.num_new_tokens
             known = len(seq.token_ids)
-            if end <= known:
+            if item.drafts:  # the sequence's last token, then the guesses to check
+                ids.extend(seq.token_ids[start:known])
+                ids.extend(item.drafts)
+            elif end <= known:
                 ids.extend(seq.token_ids[start:end])
             else:
                 # The last input is the token the previous step sampled for this
@@ -408,15 +412,16 @@ class ModelRunner:
             batch.slots.append(table[start // bs] * bs + start % bs)  # used if decode-only
             batch.rows.append(tables.row(seq, batch.table_rows, batch.table_cols, batch.table_vals))
             if item.sample:
-                sample_row[i] = len(ids) - 1
+                sample_row[i] = len(ids) - item.num_samples  # first of its sampled rows
         for i, item in enumerate(scheduled):
             if item.sample:
-                batch.sample_rows.append(sample_row[i])
-                batch.sampling.append(item.seq)
                 params = item.seq.params
-                batch.temps.append(params.temperature)
-                batch.top_ps.append(params.top_p)
-                batch.top_ks.append(params.top_k)
+                for j in range(item.num_samples):  # one per draft, plus one
+                    batch.sample_rows.append(sample_row[i] + j)
+                    batch.temps.append(params.temperature)
+                    batch.top_ps.append(params.top_p)
+                    batch.top_ks.append(params.top_k)
+                batch.sampling.append(item.seq)
         return batch
 
     def _upload(

@@ -372,3 +372,33 @@ def test_device_built_page_lists_match_host_built(
         outputs[limit] = [r.output_token_ids for r in engine.generate(prompts, params)]
         assert engine.scheduler.num_preemptions > 0
     assert outputs[0] == outputs[ModelRunner.HOST_PAGES_MAX]
+
+
+@pytest.mark.skipif(not _importable("flashinfer"), reason="flashinfer not usable")
+def test_speculative_decoding_is_as_accurate_as_reference_backend(tiny_qwen2_hd64: str) -> None:
+    """With n-gram drafts verified in mixed steps (CUDA graphs for the plain decode
+    steps), greedy tokens stay as faithful to the fp32 model as the torch backend's."""
+    from tests.conftest import load_hf_model
+
+    hf = load_hf_model(tiny_qwen2_hd64, torch.float32).to("cuda")
+    prompts = [
+        ([(5 * i + j) % 7 + 3 for j in range(3 + i % 4)] * 12)[: 20 + 7 * i] for i in range(16)
+    ]
+    scores, accepted = {}, 0
+    for name, spec in (("flashinfer", 4), ("torch", 0)):
+        engine = LLMEngine(
+            EngineConfig(
+                model=tiny_qwen2_hd64,
+                device="cuda",
+                dtype="bfloat16",
+                attention_backend=name,
+                max_model_len=512,
+                num_kv_blocks=1024 // 16,
+                max_num_batched_tokens=96,
+                speculative_tokens=spec,
+            )
+        )
+        scores[name] = _teacher_forced_agreement(engine, hf, prompts)
+        accepted += engine.scheduler.spec_accepted
+    assert accepted > 0
+    assert scores["flashinfer"] >= scores["torch"] - 0.02, scores

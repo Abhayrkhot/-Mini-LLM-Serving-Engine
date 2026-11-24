@@ -72,6 +72,7 @@ class FakeExecutor:
         next_token: Callable[[Sequence], int] | None = None,
         text: str | None = None,
         crash_after_steps: int | None = None,
+        model_kv_cache: bool = False,
     ) -> None:
         self.num_kv_blocks = num_kv_blocks
         self.block_size = block_size
@@ -89,6 +90,13 @@ class FakeExecutor:
         self.history: list[list[tuple[str, int, bool]]] = []
         self._last_sampled: dict[Sequence, int] = {}  # by the latest step
         self._busy_until = 0.0
+        # With model_kv_cache, the fake keeps the token "stored" in every physical
+        # KV slot and predicts from those slots plus the step's inputs, as the
+        # real model reads its context from the cache. Then any bookkeeping error
+        # (a position counted as computed but never written, a stale reused
+        # block, a bad prefix-cache hit, a draft not rolled back) changes outputs.
+        self.model_kv_cache = model_kv_cache
+        self._slots: dict[int, int] = {}
 
     def execute_async(self, scheduled: list[ScheduledSeq]) -> StepHandle:
         if self.crash_after_steps is not None and len(self.history) >= self.crash_after_steps:
@@ -98,9 +106,15 @@ class FakeExecutor:
         sampled: dict[Sequence, int] = {}
         for s in scheduled:
             context = self._inputs(s)
+            if self.model_kv_cache:
+                context = self._through_cache(s, context)
             if s.sample:
-                token = self._next_token(_SeqView(s.seq, context))  # type: ignore[arg-type]
-                tokens.append(token)
+                # The model's token after each input from the last real token on:
+                # one position normally, one per draft plus one when speculating.
+                for j in range(s.num_samples, 0, -1):
+                    view = _SeqView(s.seq, context[: len(context) - j + 1])
+                    token = self._next_token(view)  # type: ignore[arg-type]
+                    tokens.append(token)
                 sampled[s.seq] = token
         self._last_sampled = sampled
         ready = None
@@ -113,11 +127,28 @@ class FakeExecutor:
     def execute(self, scheduled: list[ScheduledSeq]) -> list[int]:
         return self.execute_async(scheduled).result()
 
+    def _through_cache(self, item: ScheduledSeq, context: list[int]) -> list[int]:
+        """The context as the cache holds it: earlier positions read from their slots,
+        this step's inputs written to theirs."""
+        seq, bs, start = item.seq, self.block_size, item.start
+        slot = [seq.block_table[p // bs] * bs + p % bs for p in range(len(context))]
+        try:
+            cached = [self._slots[slot[p]] for p in range(start)]
+        except KeyError as exc:
+            raise RuntimeError(
+                f"{seq.request_id}: a position before {start} was never written"
+            ) from exc
+        for p in range(start, len(context)):
+            self._slots[slot[p]] = context[p]
+        return [*cached, *context[start:]]
+
     def _inputs(self, item: ScheduledSeq) -> list[int]:
         """The sequence's tokens up to the end of this step's inputs."""
         seq = item.seq
         end = item.start + item.num_new_tokens
         known = seq.token_ids
+        if item.drafts:
+            return [*known, *item.drafts]
         if end <= len(known):
             return known[:end]
         if end == len(known) + 1 and seq in self._last_sampled:

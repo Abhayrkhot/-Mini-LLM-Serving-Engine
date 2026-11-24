@@ -32,6 +32,7 @@ def make_engine(
         vocab_size=40,
         eos_token_ids=[0],
         next_token=next_token,
+        model_kv_cache=True,
     )
     cfg = EngineConfig(model="fake", async_scheduling=async_scheduling, **config)  # type: ignore[arg-type]
     return LLMEngine(cfg, executor=executor), executor
