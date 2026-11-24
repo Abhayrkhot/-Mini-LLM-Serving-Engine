@@ -366,6 +366,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--num-kv-blocks", type=int, default=None)
     p.add_argument("--enforce-eager", action="store_true", help="disable decode CUDA graphs")
     p.add_argument(
+        "--quantization",
+        choices=["w4a16"],
+        default=None,
+        help="4-bit weights for the decoder projections (round-to-nearest at load; CUDA)",
+    )
+    p.add_argument("--quant-group-size", type=int, default=128)
+    p.add_argument(
         "--no-fused-kernels",
         dest="fused_kernels",
         action="store_false",
@@ -419,6 +426,8 @@ def main(argv: list[str] | None = None) -> None:
         kv_cache_memory_gb=args.kv_cache_memory_gb,
         num_kv_blocks=args.num_kv_blocks,
         enforce_eager=args.enforce_eager,
+        quantization=args.quantization,
+        quant_group_size=args.quant_group_size,
         fused_kernels=args.fused_kernels,
         speculative_tokens=args.speculative_tokens,
         speculative_ngram_max=args.speculative_ngram_max,

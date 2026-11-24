@@ -166,11 +166,20 @@ class ModelRunner:
         start = time.perf_counter()
         self.model = build_model(mc, self.device, self.dtype)
         load_weights(self.model, self.model_dir)
+        if config.quantization == "w4a16":
+            if self.device.type != "cuda":
+                raise ValueError("w4a16 quantization needs a CUDA device")
+            from minillm.quant import quantize_model
+
+            quantize_model(self.model, config.quant_group_size)
         self.fused_kernels = self.backend == "flashinfer" and config.fused_kernels
         self.model.enable_fused_kernels(self.fused_kernels)
-        weight_bytes = sum(p.numel() * p.element_size() for p in self.model.parameters())
+        weights = [*self.model.parameters()] + [
+            b for name, b in self.model.named_buffers() if "rotary_emb" not in name
+        ]  # 4-bit weights are buffers
+        weight_bytes = sum(t.numel() * t.element_size() for t in weights)
         logger.info(
-            "Loaded %s (%s) in %.1fs: %.2f GiB of weights, %s on %s, attention=%s%s",
+            "Loaded %s (%s) in %.1fs: %.2f GiB of weights, %s on %s, attention=%s%s%s",
             config.model,
             mc.model_type,
             time.perf_counter() - start,
@@ -179,6 +188,7 @@ class ModelRunner:
             self.device,
             self.backend,
             ", fused kernels" if self.fused_kernels else "",
+            f", {config.quantization} weights" if config.quantization else "",
         )
 
         self.generator = torch.Generator(device=self.device)
