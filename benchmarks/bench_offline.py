@@ -67,6 +67,7 @@ def run_minillm(args: argparse.Namespace) -> tuple[float, int, dict[str, Any]]:
             kv_cache_memory_gb=args.kv_cache_memory_gb,
             max_model_len=_max_len(args),
             enforce_eager=args.enforce_eager,
+            fused_kernels=args.fused_kernels,
             async_scheduling=args.async_scheduling,
         )
     )
@@ -193,6 +194,12 @@ def main() -> None:
     p.add_argument("--kv-cache-memory-gb", type=float, default=4.0)
     p.add_argument("--hf-batch-size", type=int, default=32)
     p.add_argument("--enforce-eager", action="store_true", help="minillm: no CUDA graphs")
+    p.add_argument(
+        "--no-fused-kernels",
+        dest="fused_kernels",
+        action="store_false",
+        help="minillm: PyTorch ops instead of FlashInfer's fused norm/rotary/SiLU kernels",
+    )
     p.add_argument(
         "--no-async-scheduling",
         dest="async_scheduling",

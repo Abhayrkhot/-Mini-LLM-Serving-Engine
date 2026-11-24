@@ -9,8 +9,10 @@ results/h200-profile holds benchmarks/profile_step.py output per model.
 from __future__ import annotations
 
 import glob
+import itertools
 import json
 import os
+import re
 import sys
 from typing import Any
 
@@ -37,55 +39,68 @@ def fmt(x: float | None, suffix: str = "") -> str:
 
 def offline_table() -> str:
     rows = [
-        "| model | workload | minillm | minillm, sync scheduling | HF `generate` | vLLM 0.34 "
+        "| model | workload | minillm | minillm, unfused kernels | HF `generate` | vLLM 0.34 "
         "| minillm vs HF | minillm vs vLLM |",
         "|---|---|---:|---:|---:|---:|---:|---:|",
     ]
     for name, d in MODELS:
         for ratio, label in (("0", "uniform lengths"), ("0.9", "lengths vary ±90%")):
-            m, sync = tput(d, "minillm", ratio), tput(d, "minillm-sync", ratio)
+            m, unfused = tput(d, "minillm", ratio), tput(d, "minillm-unfused", ratio)
             hf, vllm = tput(d, "hf", ratio), tput(d, "vllm", ratio)
             vs_hf = f"{m / hf:.1f}×" if m and hf else "–"
             vs_vllm = f"{100 * m / vllm:.0f}%" if m and vllm else "–"
             rows.append(
-                f"| {name} | {label} | {fmt(m)} | {fmt(sync)} | {fmt(hf)} | {fmt(vllm)} "
+                f"| {name} | {label} | {fmt(m)} | {fmt(unfused)} | {fmt(hf)} | {fmt(vllm)} "
                 f"| {vs_hf} | {vs_vllm} |"
             )
     return "\n".join(rows)
 
 
+def profile(d: str, variant: str = "") -> dict[str, Any] | None:
+    return load(os.path.join(ROOT, "h200-profile", f"{d.removeprefix('h200-')}{variant}.json"))
+
+
 def profile_table() -> str:
     rows = [
-        "| model | batch | GPU | engine CPU | step, sync | step, async |",
-        "|---|---:|---:|---:|---:|---:|",
+        "| model | batch | GPU, unfused | GPU | engine CPU | step, sync | step, async |",
+        "|---|---:|---:|---:|---:|---:|---:|",
     ]
     for name, d in MODELS:
-        r = load(os.path.join(ROOT, "h200-profile", f"{d.removeprefix('h200-')}.json"))
+        r, u = profile(d), profile(d, "-unfused")
+        unfused = {row["batch"]: row["gpu_ms"] for row in (u or {}).get("rows", [])}
         for row in (r or {}).get("rows", []):
+            before = unfused.get(row["batch"])
             rows.append(
-                f"| {name} | {row['batch']} | {row['gpu_ms']:.2f} | {row['async_cpu_ms']:.2f} "
+                f"| {name} | {row['batch']} | {'–' if before is None else f'{before:.2f}'} "
+                f"| {row['gpu_ms']:.2f} | {row['async_cpu_ms']:.2f} "
                 f"| {row['sync_step_ms']:.2f} | {row['async_step_ms']:.2f} |"
             )
     return "\n".join(rows)
 
 
+ATTENTION = re.compile(r"flashinfer::(BatchPrefill|BatchDecode|\w*MergeStates)")
+
+
 def kernel_summary() -> str:
-    """GPU time of one batch-1 decode step: GEMMs, attention and everything else."""
+    """GPU time of one batch-1 decode step: GEMMs, attention and everything else
+    (norms, residual adds, rotary, activation, casts, KV-cache writes, sampling)."""
     rows = [
-        "| model | kernel launches | GPU time | GEMMs | attention | other kernels |",
-        "|---|---:|---:|---:|---:|---:|",
+        "| model | kernels | launches | GPU time | GEMMs | attention | everything else |",
+        "|---|---|---:|---:|---:|---:|---:|",
     ]
-    for name, d in MODELS:
-        r = load(os.path.join(ROOT, "h200-profile", f"{d.removeprefix('h200-')}.json"))
+    for (name, d), (variant, label) in itertools.product(
+        MODELS, (("-unfused", "unfused"), ("", "fused"))
+    ):
+        r = profile(d, variant)
         if not r or "kernels" not in r:
             continue
         ks = r["kernels"]["rows"]
         total = sum(k["us"] for k in ks)
         gemm = sum(k["us"] for k in ks if "nvjet" in k["kernel"] or "cublas" in k["kernel"].lower())
-        attn = sum(k["us"] for k in ks if "flashinfer" in k["kernel"])
+        attn = sum(k["us"] for k in ks if ATTENTION.search(k["kernel"]))
         other = total - gemm - attn
         rows.append(
-            f"| {name} | {sum(k['launches'] for k in ks):,.0f} | {total / 1e3:.2f} ms "
+            f"| {name} | {label} | {sum(k['launches'] for k in ks):,.0f} | {total / 1e3:.2f} ms "
             f"| {gemm / 1e3:.2f} ms | {attn / 1e3:.2f} ms "
             f"| {other / 1e3:.2f} ms ({100 * other / total:.0f}%) |"
         )

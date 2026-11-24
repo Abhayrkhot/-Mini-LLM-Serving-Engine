@@ -163,6 +163,7 @@ def main() -> None:
     p.add_argument("--steps", type=int, default=100)
     p.add_argument("--warmup", type=int, default=20)
     p.add_argument("--enforce-eager", action="store_true")
+    p.add_argument("--no-fused-kernels", dest="fused_kernels", action="store_false")
     p.add_argument("--kernels", type=int, default=None, metavar="B", help="kernel breakdown at B")
     p.add_argument("--output", default=None)
     args = p.parse_args()
@@ -173,6 +174,7 @@ def main() -> None:
             max_num_seqs=max(args.batch_sizes),
             max_num_batched_tokens=max(8192, args.prompt_len * max(args.batch_sizes) // 8),
             enforce_eager=args.enforce_eager,
+            fused_kernels=args.fused_kernels,
         )
     )
     timer = PhaseTimer(engine)

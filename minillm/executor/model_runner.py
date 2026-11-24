@@ -152,9 +152,11 @@ class ModelRunner:
         start = time.perf_counter()
         self.model = build_model(mc, self.device, self.dtype)
         load_weights(self.model, self.model_dir)
+        self.fused_kernels = self.backend == "flashinfer" and config.fused_kernels
+        self.model.enable_fused_kernels(self.fused_kernels)
         weight_bytes = sum(p.numel() * p.element_size() for p in self.model.parameters())
         logger.info(
-            "Loaded %s (%s) in %.1fs: %.2f GiB of weights, %s on %s, attention=%s",
+            "Loaded %s (%s) in %.1fs: %.2f GiB of weights, %s on %s, attention=%s%s",
             config.model,
             mc.model_type,
             time.perf_counter() - start,
@@ -162,6 +164,7 @@ class ModelRunner:
             str(self.dtype).removeprefix("torch."),
             self.device,
             self.backend,
+            ", fused kernels" if self.fused_kernels else "",
         )
 
         self.generator = torch.Generator(device=self.device)

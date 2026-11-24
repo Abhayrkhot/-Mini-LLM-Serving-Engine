@@ -39,6 +39,9 @@ class EngineConfig:
 
     enforce_eager: bool = False
     """Disable decode CUDA graphs (used with the flashinfer backend on CUDA)."""
+    fused_kernels: bool = True
+    """With the flashinfer backend, run RMSNorm (with the residual add), rotary
+    embeddings and SiLU-and-mul as FlashInfer's fused kernels instead of PyTorch ops."""
     async_scheduling: bool = True
     """Schedule and launch step n+1 while the GPU runs step n. A request that stops on
     EOS or a stop token then costs one discarded extra token of compute."""

@@ -110,22 +110,20 @@ def _teacher_forced_agreement(engine: LLMEngine, hf: object, prompts: list[list[
     return agree / total
 
 
-ENGINE_CASES = [
+FLASHINFER = backend_param("flashinfer").marks  # type: ignore[attr-defined]
+ENGINE_CASES = [  # (backend, eager, fused kernels)
+    pytest.param("flashinfer", False, True, id="flashinfer-cudagraphs", marks=FLASHINFER),
+    pytest.param("flashinfer", True, True, id="flashinfer-eager", marks=FLASHINFER),
+    pytest.param("flashinfer", False, False, id="flashinfer-unfused", marks=FLASHINFER),
     pytest.param(
-        "flashinfer", False, id="flashinfer-cudagraphs", marks=backend_param("flashinfer").marks
-    ),
-    pytest.param(
-        "flashinfer", True, id="flashinfer-eager", marks=backend_param("flashinfer").marks
-    ),
-    pytest.param(
-        "flash_attn", True, id="flash_attn-eager", marks=backend_param("flash_attn").marks
+        "flash_attn", True, False, id="flash_attn-eager", marks=backend_param("flash_attn").marks
     ),
 ]
 
 
-@pytest.mark.parametrize(("backend", "eager"), ENGINE_CASES)
+@pytest.mark.parametrize(("backend", "eager", "fused"), ENGINE_CASES)
 def test_engine_is_as_accurate_as_reference_backend(
-    backend: str, eager: bool, tiny_qwen2_hd64: str
+    backend: str, eager: bool, fused: bool, tiny_qwen2_hd64: str
 ) -> None:
     """In bf16, the fast backend must pick the fp32 model's argmax as often as the torch backend.
 
@@ -154,6 +152,7 @@ def test_engine_is_as_accurate_as_reference_backend(
                 num_kv_blocks=1024 // block_size if block_size < 256 else 8,
                 max_num_batched_tokens=96,  # chunked prefill mixed with decodes
                 enforce_eager=eager,
+                fused_kernels=fused,
             )
         )
         scores[name] = _teacher_forced_agreement(engine, hf, prompts)
@@ -165,9 +164,9 @@ def test_engine_is_as_accurate_as_reference_backend(
     assert scores[backend] >= scores["torch"] - 0.02, scores
 
 
-@pytest.mark.parametrize(("backend", "eager"), ENGINE_CASES[:2])
+@pytest.mark.parametrize(("backend", "eager", "fused"), ENGINE_CASES[:3])
 def test_async_scheduling_matches_sync_exactly(
-    backend: str, eager: bool, tiny_qwen2_hd64: str
+    backend: str, eager: bool, fused: bool, tiny_qwen2_hd64: str
 ) -> None:
     """Async scheduling changes when the CPU sees each token, not what is computed.
 
@@ -195,6 +194,7 @@ def test_async_scheduling_matches_sync_exactly(
                 num_kv_blocks=512,
                 max_num_batched_tokens=64,
                 enforce_eager=eager,
+                fused_kernels=fused,
                 async_scheduling=async_scheduling,
             )
         )
@@ -254,3 +254,50 @@ def test_launching_a_step_never_waits_for_the_gpu(eager: bool, tiny_qwen2_hd64: 
         assert elapsed_ms < spin_ms / 5, f"step took {elapsed_ms:.0f} ms: something synchronized"
     while engine.has_unfinished_requests():
         engine.step()
+
+
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.skipif(not _importable("flashinfer"), reason="flashinfer not usable")
+def test_fused_ops_match_pytorch_reference(head_dim: int) -> None:
+    """Each fused kernel computes what the reference PyTorch ops do, up to bf16 rounding.
+
+    Inputs mimic the real call sites: q and k are strided slices of one qkv tensor,
+    and positions go up to the model's longest context.
+    """
+    from minillm.layers.fused import FusedOps
+    from minillm.models.llama import RMSNorm, RotaryEmbedding, apply_rotary
+
+    torch.manual_seed(head_dim)
+    ops = FusedOps()
+    dev, bf16 = "cuda", torch.bfloat16
+    tokens, hidden, heads, kv_heads, inter = 37, 896, 14, 2, 4864
+
+    def close(actual: torch.Tensor, expected: torch.Tensor) -> None:
+        torch.testing.assert_close(actual.float(), expected.float(), rtol=2e-2, atol=2e-2)
+
+    norm = RMSNorm(hidden, 1e-6).to(dev, bf16)
+    norm.weight.data.uniform_(0.5, 1.5)
+    x = torch.randn(tokens, hidden, device=dev, dtype=bf16)
+    residual = torch.randn_like(x)
+    close(ops.rmsnorm(x, norm.weight, norm.eps), norm(x))
+    expected_residual, expected_out = x + residual, norm(x + residual)
+    out = ops.add_rmsnorm(x.clone(), residual, norm.weight, norm.eps)
+    close(residual, expected_residual)
+    close(out, expected_out)
+
+    rope = RotaryEmbedding(head_dim, 32768, 1e6, None)
+    rope.build(torch.device(dev))
+    q_size, kv_size = heads * head_dim, kv_heads * head_dim
+    qkv = torch.randn(tokens, q_size + 2 * kv_size, device=dev, dtype=bf16)
+    positions = torch.randint(0, 32768, (tokens,), device=dev)
+    q, k, _ = qkv.clone().split([q_size, kv_size, kv_size], dim=-1)
+    cos, sin = rope(positions)
+    expected_q = apply_rotary(q.reshape(tokens, heads, head_dim), cos, sin)
+    expected_k = apply_rotary(k.reshape(tokens, kv_heads, head_dim), cos, sin)
+    ops.rope(positions, q, k, head_dim, rope.cos_sin_cache)  # in place on the strided views
+    close(q.reshape(tokens, heads, head_dim), expected_q)
+    close(k.reshape(tokens, kv_heads, head_dim), expected_k)
+
+    gate_up = torch.randn(tokens, 2 * inter, device=dev, dtype=bf16)
+    gate, up = gate_up.chunk(2, dim=-1)
+    close(ops.silu_and_mul(gate_up), torch.nn.functional.silu(gate) * up)
