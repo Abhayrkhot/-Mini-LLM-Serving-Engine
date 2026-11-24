@@ -50,6 +50,7 @@ def random_paged_batch(
     device: str = "cpu",
     dtype: torch.dtype = torch.float32,
     backend: str = "torch",
+    decodes_first: bool = False,
 ) -> PagedBatch:
     """A batch mixing decodes, full prompts and chunks on cached context, in shuffled blocks.
 
@@ -64,6 +65,10 @@ def random_paged_batch(
 
     k_lens = [rng.randint(1, max_len) for _ in range(rng.randint(1, 5))]
     q_lens = [rng.choice([1, n, rng.randint(1, n)]) for n in k_lens]
+    if decodes_first:  # a mixed step as the engine lays it out: decodes, then chunks
+        chunk, prompt = min(300, max_len), min(120, max_len)
+        k_lens = [rng.randint(1, max_len) for _ in range(rng.randint(1, 6))] + [chunk, prompt]
+        q_lens = [1] * (len(k_lens) - 2) + [min(64, chunk), prompt]
     num_blocks = sum(cdiv(n, block_size) for n in k_lens) + 4
     k_cache = randn(num_blocks, block_size, num_kv_heads, head_dim)
     v_cache = randn(num_blocks, block_size, num_kv_heads, head_dim)

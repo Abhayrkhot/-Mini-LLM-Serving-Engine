@@ -90,6 +90,7 @@ class _Batch:
     """
 
     num_seqs: int
+    num_decode: int = 0  # sequences with one new token; they come first
     input_ids: list[int] = field(default_factory=list)
     starts: list[int] = field(default_factory=list)  # first position each sequence computes
     query_lens: list[int] = field(default_factory=list)
@@ -366,11 +367,20 @@ class ModelRunner:
 
     def _prepare(self, scheduled: list[ScheduledSeq]) -> _Batch:
         bs = self.block_size
-        batch = _Batch(num_seqs=len(scheduled))
+        # Sequences with one new token first, prompt chunks after: in a mixed step
+        # the two groups run through different attention kernels (plan_split).
+        # Sampled tokens still come back in scheduled order.
+        decodes = [i for i, item in enumerate(scheduled) if item.num_new_tokens == 1]
+        order = decodes
+        if len(decodes) < len(scheduled):
+            order = decodes + [i for i, item in enumerate(scheduled) if item.num_new_tokens > 1]
+        batch = _Batch(num_seqs=len(scheduled), num_decode=len(decodes))
         tables = self.block_tables
         tables.begin_step()
         ids = batch.input_ids
-        for item in scheduled:
+        sample_row: dict[int, int] = {}
+        for i in order:
+            item = scheduled[i]
             seq = item.seq
             start = item.start
             end = start + item.num_new_tokens
@@ -398,9 +408,12 @@ class ModelRunner:
             batch.slots.append(table[start // bs] * bs + start % bs)  # used if decode-only
             batch.rows.append(tables.row(seq, batch.table_rows, batch.table_cols, batch.table_vals))
             if item.sample:
-                batch.sample_rows.append(len(ids) - 1)
-                batch.sampling.append(seq)
-                params = seq.params
+                sample_row[i] = len(ids) - 1
+        for i, item in enumerate(scheduled):
+            if item.sample:
+                batch.sample_rows.append(sample_row[i])
+                batch.sampling.append(item.seq)
+                params = item.seq.params
                 batch.temps.append(params.temperature)
                 batch.top_ps.append(params.top_p)
                 batch.top_ks.append(params.top_k)
@@ -548,14 +561,23 @@ class ModelRunner:
             decode_only=batch.decode_only,
         )
         if self.flashinfer is not None:
-            qo_indptr = None
-            if not batch.decode_only:
+            indices = dev["page_indices"]
+            if batch.decode_only:
+                meta.flashinfer = self.flashinfer.plan_layout(
+                    batch.indptr, indices, batch.last_page_len
+                )
+            else:
                 qo_indptr = [0]
                 for q_len in batch.query_lens:
                     qo_indptr.append(qo_indptr[-1] + q_len)
-            meta.flashinfer = self.flashinfer.plan_layout(
-                batch.indptr, dev["page_indices"], batch.last_page_len, qo_indptr
-            )
+                if batch.num_decode:
+                    meta.flashinfer = self.flashinfer.plan_split(
+                        batch.indptr, indices, batch.last_page_len, qo_indptr, batch.num_decode
+                    )
+                else:
+                    meta.flashinfer = self.flashinfer.plan_layout(
+                        batch.indptr, indices, batch.last_page_len, qo_indptr
+                    )
         hidden: torch.Tensor = self.model(ids, dev["positions"], meta)
         return hidden
 
