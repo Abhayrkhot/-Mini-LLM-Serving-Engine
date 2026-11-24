@@ -159,6 +159,31 @@ Prometheus series (all prefixed `minillm_`):
 
 TTFT counts from arrival, so queueing time is included.
 
+## Container
+
+The [`Dockerfile`](Dockerfile) builds a CUDA serving image with no CUDA toolkit or compiler inside. PyTorch 2.11 is built for CUDA 12.8, and its wheels bring the CUDA libraries. FlashInfer 0.6.17 comes with its precompiled kernels (`flashinfer-jit-cache`), so nothing is compiled at runtime. Both are the newest releases with CUDA 12.8 builds. The driver comes from the host through the NVIDIA Container Toolkit and must support CUDA 12.8 (570 or newer).
+
+```bash
+docker build -t minillm .
+docker run --gpus all -p 8000:8000 -v hf-cache:/data minillm \
+  --model Qwen/Qwen2.5-0.5B-Instruct
+```
+
+- Arguments after the image name go to `minillm-serve`.
+- The server runs as an unprivileged user (uid 1000).
+- Weights download to the `/data` volume (`HF_HOME`). To reuse the host's cache, mount it instead with `-v ~/.cache/huggingface:/data` (it must be writable by uid 1000). Add `-e HF_TOKEN` for gated models.
+- A health check polls `/health` on port 8000. It passes once the weights are loaded and the CUDA graphs captured.
+- The image is 10.2 GB unpacked (5.7 GB compressed). Most of it is the CUDA libraries that ship with torch (4.3 GB: cuDNN, cuBLAS, NCCL and others), FlashInfer's kernels (1.8 GB) and torch itself (1.6 GB).
+
+**Checked on a GPU** (RTX 3050 Ti Laptop, 4 GB, driver 580) serving Qwen2.5-0.5B-Instruct with `--max-model-len 2048 --max-num-seqs 16 --gpu-memory-utilization 0.85`. The log shows `attention=flashinfer, fused kernels` and decode CUDA graphs captured. `/health` answered about 30 s after start with the 1 GB weight download, and 9 s with the weights cached. Completions, streaming chat and 32 concurrent requests returned sensible text, the container turned healthy, and `docker stop` shut it down cleanly. The image has not been run on an H200 yet; it includes FlashInfer's sm90 kernels for head dims 64 and 128.
+
+**In CI** the `container` workflow builds the image and checks it on CPU, since GitHub's runners have no GPU. It runs on every push to master and on pull requests that change the Dockerfile or `pyproject.toml`:
+
+- torch and FlashInfer import, with torch built for CUDA 12.8
+- `minillm-serve --help` runs
+- the fake-engine server (`benchmarks/fake_server.py`) answers a completion and a streamed chat from inside the container, as the image's user
+- the CPU test suite passes against the installed package
+
 ## Testing
 
 ```bash
@@ -343,6 +368,7 @@ scripts/     report.py, readme_tables.py
 scripts/explorer/  Slurm + Apptainer jobs: setup, GPU tests, benchmarks, profiling
 results/     H200 benchmark results (JSON + REPORT.md per run)
 tests/
+Dockerfile   CUDA serving image (see Container)
 ```
 
 ## Roadmap
@@ -350,7 +376,7 @@ tests/
 1. **Cut the engine's CPU time per step.** With the kernels fused, large batches of a small model are CPU-bound again: at batch 256 on 0.5B the engine spends 2.9 ms of CPU per step against 2.4 ms of GPU work. Most of it is Python building per-token input lists and FlashInfer page tables from scratch each step; keeping them in preallocated arrays and updating them incrementally, as vLLM does, would remove most of that.
 2. **CUDA graphs for mixed steps.** Steps that contain prompt chunks still run eagerly, which is part of why the variable-length workload trails vLLM by more than the uniform one. vLLM captures everything except attention ("piecewise" graphs).
 3. **Speculative decoding** (n-gram / prompt lookup first) and **4-bit weights**, using the W4A16 Triton kernel from Quantized-inference-lab.
-4. **Container image** built and smoke-tested in CI on a GPU runner.
+4. **A GPU smoke test for the container image in CI.** CI builds the image and tests it on CPU; the GPU path has only been checked by hand (see Container).
 
 ## License
 
