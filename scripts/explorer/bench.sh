@@ -5,7 +5,8 @@
 #      SKIP_OFFLINE / SKIP_ONLINE (1 to skip), MINILLM_ARGS (extra minillm flags, e.g.
 #      --enforce-eager), WORKERS (load-generator processes, default 4).
 #      minillm variants (ENGINES and SERVE_ENGINES): minillm-sync waits for each step's
-#      tokens before scheduling the next (--no-async-scheduling); minillm-1proc (online
+#      tokens before scheduling the next (--no-async-scheduling); minillm-unfused runs
+#      norms/rotary/SiLU as PyTorch ops (--no-fused-kernels); minillm-1proc (online
 #      only) runs the engine on a thread in the API process.
 #      Results: $ROOT/results/<tag>/ + REPORT.md.
 set -uo pipefail
@@ -21,6 +22,7 @@ LIMITS=(--max-num-seqs 256 --max-num-batched-tokens 8192)
 variant_flags() {  # flags for a minillm variant label
   case $1 in
     minillm-sync) echo --no-async-scheduling ;;
+    minillm-unfused) echo --no-fused-kernels ;;
     minillm-1proc) echo --no-engine-process ;;
   esac
 }

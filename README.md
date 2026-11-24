@@ -1,24 +1,25 @@
 # minillm: a small LLM serving engine
 
-A from-scratch inference server for decoder-only LLMs (Llama 2/3, Mistral, Qwen2/2.5, Qwen3) in about 3,100 lines of Python:
+A from-scratch inference server for decoder-only LLMs (Llama 2/3, Mistral, Qwen2/2.5, Qwen3) in about 4,200 lines of Python:
 
 - a paged KV cache with reference-counted blocks
 - continuous batching with chunked prefill
 - preemption by recompute
 - prefix caching
-- FlashInfer paged-attention kernels and CUDA graphs for decode
+- FlashInfer paged attention and fused norm, rotary and activation kernels
+- CUDA graphs for decode, and async scheduling that overlaps CPU work with the GPU
 - an OpenAI-compatible streaming API with Prometheus metrics
 
 It loads Hugging Face safetensors checkpoints directly and implements the model itself. `transformers` is used only for tokenizers and as the reference in tests.
 
-**On one H200, minillm reaches 64–82% of vLLM 0.34's offline throughput and 2.6–13.7× Hugging Face `generate`. Under a burst of streaming requests it serves 78% of vLLM's throughput on Qwen2.5-7B and about as much as vLLM on 0.5B**, with greedy output checked against Hugging Face on the same hardware ([results](#results-on-an-h200)).
+**On one H200, minillm outperforms vLLM 0.34 on Qwen2.5-0.5B: 110–113% of its offline throughput, lower per-token latency and time to first token at every load, and 1.2–1.5× its burst serving throughput. On Qwen2.5-7B it reaches 95% of vLLM offline (77% with variable lengths) and matches it at light load and under a burst.** It runs 3.3–20× faster than Hugging Face `generate`, with greedy output checked against Hugging Face on the same hardware ([results](#results-on-an-h200)).
 
 ## Status
 
 | | |
 |---|---|
 | **Verified on CPU / MPS** | 117 tests pass on a laptop CPU. Greedy output matches Hugging Face token for token on Qwen2, Qwen3 and Llama 3 (with RoPE scaling), through batching, chunked prefill, preemption and prefix-cache hits. On Qwen2.5-0.5B-Instruct, 288 of 288 generated tokens are HF's argmax on CPU and on Apple MPS. The server is tested over real HTTP: streaming, stop strings, client disconnects, backpressure and engine crashes. |
-| **Verified on an H200** | 136 tests pass, including FlashInfer kernels against the reference attention (head dims 64 and 128, decodes, prompts, chunks on cached context), the engine with and without CUDA graphs under preemption, async scheduling (same tokens as synchronous, and no device sync while launching a step), and Qwen2.5-0.5B: exact against HF in fp32, and in bf16 at least 97% of tokens are HF's argmax with only near-ties differing. |
+| **Verified on an H200** | 140 tests pass, including FlashInfer kernels against the reference attention (head dims 64 and 128, decodes, prompts, chunks on cached context), the engine with and without CUDA graphs under preemption, fused kernels against the PyTorch ops, async scheduling (same tokens as synchronous, and no device sync while launching a step), and Qwen2.5-0.5B: exact against HF in fp32, and in bf16 at least 97% of tokens are HF's argmax with only near-ties differing. |
 | **Written, not run** | The `flash_attn` backend. No prebuilt flash-attn wheel loads against the torch 2.14 the benchmarks used, so it stays unverified. |
 | **Not built yet** | Speculative decoding, quantized weights, multi-GPU (see the roadmap). |
 
@@ -74,13 +75,15 @@ It loads Hugging Face safetensors checkpoints directly and implements the model 
 - `flashinfer` (the default on CUDA): FlashInfer's paged prefill and decode kernels read blocks in place through the block table. FlashInfer plans each step once on the CPU, and every layer reuses that plan.
 - `flash_attn`: flash-attn's varlen and kv-cache kernels with block tables (block size 256). Written, but not yet run.
 
-**CUDA graphs** ([cuda_graphs.py](minillm/executor/cuda_graphs.py)). In eager mode, a decode step launches about 30 kernels per layer from Python, and for a small model that launch overhead outweighs the GPU work. At startup minillm captures the decode forward pass as CUDA graphs at a ladder of batch sizes (1, 2, 4, 8, 16, 24, 32, then every 16). Each decode step:
+**CUDA graphs** ([cuda_graphs.py](minillm/executor/cuda_graphs.py)). In eager mode, a decode step launches every kernel from Python, a dozen per layer (about 45 without fused kernels), and for a small model that launch overhead outweighs the GPU work. At startup minillm captures the decode forward pass as CUDA graphs at a ladder of batch sizes (1, 2, 4, 8, 16, 24, 32, then every 16). Each decode step:
 
 1. pads its batch up to the nearest captured size; padded rows write into a scratch KV block the block manager never hands out
 2. copies inputs into static buffers and refills FlashInfer's fixed index buffers
 3. replays the graph
 
 Steps that contain prompt chunks run eagerly. `--enforce-eager` turns graphs off.
+
+**Fused kernels** ([fused.py](minillm/layers/fused.py)). Written as plain PyTorch, RMSNorm is eight small kernels (casts, square, mean, add, rsqrt, two multiplies), rotary embeddings about ten per tensor, and SiLU-and-mul two. At batch 1 they took 62% of a 0.5B decode step's GPU time. On CUDA minillm runs each as one FlashInfer kernel instead, and folds every residual add into the norm that follows it (`residual += x; x = rmsnorm(residual)` in one kernel), the layer structure vLLM and SGLang use. Rotary embeddings rotate q and k in place, straight from the fused QKV projection's output. A 0.5B decode step drops from 1,153 kernel launches to 328 and from 2.2 to 1.1 ms of GPU time. The plain PyTorch path still runs on CPU, MPS and the `torch` backend, where the parity tests check it token for token against Hugging Face; `--no-fused-kernels` selects it on CUDA too.
 
 **Async scheduling** ([engine.py](minillm/engine.py), [scheduler.py](minillm/scheduler.py)). Every step has CPU work (scheduling, building input tensors, FlashInfer planning, applying the sampled tokens) and GPU work. Run one after the other, the GPU idles during the CPU part. So, as in vLLM, the engine launches step n+1 before it collects step n's tokens:
 
@@ -174,7 +177,7 @@ srun -p gpu-short --gres=gpu:h200:1 -c 8 --mem=48G -t 40 bash scripts/explorer/t
 | `test_engine_core.py` | The engine process: streamed output equals offline output, metrics cross the process boundary, closing a stream aborts the request in the engine, invalid requests are rejected without killing it, and a crash, a SIGKILL or a failed startup is reported instead of hanging. |
 | `test_async_scheduling.py` | Async scheduling generates exactly what synchronous scheduling does: a Hypothesis test runs 150 random workloads mixing chunked prefill, preemption, EOS, stop tokens, length limits and `max_num_seqs`. An EOS stop costs exactly one discarded step and a length limit none; aborts and preemption while a step is in flight leave other requests untouched. A deliberately broken scheduler fails it (mutation-checked). |
 | `test_async_engine.py` | Streamed output equals offline output. Closing a stream aborts its request. An executor crash fails in-flight and new requests. |
-| `test_gpu.py` | CUDA only. Each GPU kernel matches the torch reference on random paged batches. The engine in bf16, with and without CUDA graphs and under preemption, picks the fp32 model's argmax as often as the torch backend does in bf16. Async and synchronous scheduling generate identical tokens, sampled ones included. With half a second of GPU work queued, launching a step still returns immediately, so nothing on the launch path waits for the GPU. |
+| `test_gpu.py` | CUDA only. Each GPU kernel matches the torch reference on random paged batches. The engine in bf16, with and without CUDA graphs and under preemption, picks the fp32 model's argmax as often as the torch backend does in bf16. The fused norm, residual-add, rotary and SiLU kernels match the PyTorch ops within bf16 rounding, rotary included on strided q/k views out to 32k positions. Async and synchronous scheduling generate identical tokens, sampled ones included. With half a second of GPU work queued, launching a step still returns immediately, so nothing on the launch path waits for the GPU. |
 | `test_real_model.py` | On a real checkpoint, every generated token is HF's argmax: exactly with the torch backend in fp32, and in bf16 for the GPU backends (at least 97%, with only near-ties differing). Teacher forcing is used so that one float near-tie can't send the comparison down a different continuation. |
 
 The scheduler, server and async tests run on `FakeExecutor`, a deterministic stand-in for the GPU. Its next token depends only on the sequence's own tokens, so outputs must be identical however requests are batched, chunked or preempted. That's the same property the real engine needs.
@@ -194,53 +197,56 @@ Both harnesses send token-id prompts, so every engine sees byte-identical input:
 
 One NVIDIA H200 per job, running the vLLM 0.34 container (torch 2.14, CUDA 13, FlashInfer 0.7.3), bf16.
 
-- **minillm:** FlashInfer attention, decode CUDA graphs and async scheduling (the defaults). `minillm-sync` is the same engine with `--no-async-scheduling`.
+- **minillm:** FlashInfer attention and fused kernels, decode CUDA graphs and async scheduling (the defaults). `minillm-unfused` is the same engine with `--no-fused-kernels`.
 - **vLLM:** defaults (CUDA graphs, prefix caching, chunked prefill).
 - **Shared limits:** both engines get 256 concurrent sequences and an 8,192-token step budget.
 - **HF `generate`:** static batches of 64.
 - **Workload:** random token-id prompts of about 512 tokens with 128 output tokens (EOS ignored), 500 requests per measurement.
 
-Engines in a table ran back to back on the same GPU, with two exceptions, both caused by busy nodes. HF's `generate` loop, which is CPU-bound, ran 1.4–3.9× slower in the first jobs than in a separate HF-only job and in earlier runs, so HF's numbers come from that job. The first 0.5B job also shared its node with another long job, and vLLM's server, also CPU-heavy, had roughly twice its usual per-token latency there at mid load, so the 0.5B online sweep comes from a second job. These are single runs on a shared cluster, so treat differences under about 10% as noise: vLLM's 0.5B offline figure has measured 34k, 39k and 41k tok/s in three jobs. Raw JSON and per-run reports are in [`results/`](results).
+minillm, minillm-unfused and vLLM ran back to back on the same GPU, one job per model. HF ran in a separate job: its `generate` loop is CPU-bound, and on a busy node it ran up to 3.9× slower. These are single runs on a shared cluster, so treat differences under about 10% as noise: vLLM's 0.5B offline figure has measured 34k, 39k, 41k and 41k tok/s in four jobs, and its 0.5B burst figure 23k to 29k. Correctness is checked against Hugging Face (see Testing), not against vLLM. Raw JSON and per-run reports are in [`results/`](results).
 
 **Offline throughput** (output tokens/s; HF counts only the tokens each request asked for):
 
-| model | workload | minillm | minillm, sync scheduling | HF `generate` | vLLM 0.34 | minillm vs HF | minillm vs vLLM |
+| model | workload | minillm | minillm, unfused kernels | HF `generate` | vLLM 0.34 | minillm vs HF | minillm vs vLLM |
 |---|---|---:|---:|---:|---:|---:|---:|
-| Qwen2.5-0.5B | uniform lengths | 31,253 | 23,691 | 3,108 | 39,000 | 10.1× | 80% |
-| Qwen2.5-0.5B | lengths vary ±90% | 18,362 | 14,576 | 1,338 | 22,477 | 13.7× | 82% |
-| Qwen2.5-7B | uniform lengths | 6,058 | 5,755 | 2,293 | 7,904 | 2.6× | 77% |
-| Qwen2.5-7B | lengths vary ±90% | 4,630 | 4,370 | 534 | 7,242 | 8.7× | 64% |
+| Qwen2.5-0.5B | uniform lengths | 46,897 | 31,525 | 3,108 | 41,418 | 15.1× | 113% |
+| Qwen2.5-0.5B | lengths vary ±90% | 27,000 | 18,475 | 1,338 | 24,487 | 20.2× | 110% |
+| Qwen2.5-7B | uniform lengths | 7,520 | 6,021 | 2,293 | 7,885 | 3.3× | 95% |
+| Qwen2.5-7B | lengths vary ±90% | 5,567 | 4,609 | 534 | 7,239 | 10.4× | 77% |
 
-- **minillm reaches 64–82% of vLLM and 2.6–13.7× HF.**
-- **Async scheduling adds 26–32% on 0.5B and 5–6% on 7B.** On a small model the CPU's share of a step is large, and it now runs while the GPU works; 7B is limited by the GPU itself.
-- **Variable lengths break static batching.** HF pads every batch to its longest prompt and decodes until its longest request ends, so it loses 57% of its throughput on 0.5B and 77% on 7B. The continuous-batching engines lose 41–42% on 0.5B; on 7B minillm loses 24% and vLLM 8%.
-- **7B with variable lengths is the weakest case (64%).** Steps that mix prompt chunks with decodes run eagerly in minillm, while vLLM captures graphs for those steps too.
-- **CUDA graphs add 46–66% on 0.5B and 5–7% on 7B** (measured before async scheduling; [`results/*-eager`](results)).
+- **On 0.5B minillm is faster than vLLM: 113% of its throughput, and 110% with variable lengths.** On 7B it reaches 95%, and 77% with variable lengths. It runs 3.3–20× faster than HF.
+- **Fused kernels add 46–49% on 0.5B and 21–25% on 7B.** See the profile below.
+- **Async scheduling** added 26–32% on 0.5B and 5–6% on 7B when it was introduced (measured against `--no-async-scheduling` before kernel fusion).
+- **Variable lengths break static batching.** HF pads every batch to its longest prompt and decodes until its longest request ends, so it loses 57% of its throughput on 0.5B and 77% on 7B. The continuous-batching engines lose 41–42% on 0.5B; on 7B minillm loses 26% and vLLM 8%.
+- **7B with variable lengths is the weakest case (77%).** Steps that mix prompt chunks with decodes run eagerly in minillm, while vLLM captures graphs for those steps too.
+- **CUDA graphs add 46–66% on 0.5B and 5–7% on 7B** (measured before async scheduling and fused kernels; [`results/*-eager`](results)).
 
-**Where a decode step's time goes** (`benchmarks/profile_step.py`; B requests decoding in lockstep after 512-token prompts, ms per step). *GPU* is the device time of the step's work alone, measured while a spin kernel keeps the GPU ahead of the CPU, so launch gaps don't count. *Engine CPU* is everything else the engine does per step: scheduling, building inputs, launching, applying tokens.
+**Where a decode step's time goes** (`benchmarks/profile_step.py`; B requests decoding in lockstep after 512-token prompts, ms per step). *GPU* is the device time of the step's work alone, measured while a spin kernel keeps the GPU ahead of the CPU, so launch gaps don't count. *Engine CPU* is everything else the engine does per step: scheduling, building inputs, launching, applying tokens. Everything except the "GPU, unfused" column is with fused kernels.
 
-| model | batch | GPU | engine CPU | step, sync | step, async |
-|---|---:|---:|---:|---:|---:|
-| Qwen2.5-0.5B | 1 | 2.16 | 0.39 | 2.37 | 2.17 |
-| Qwen2.5-0.5B | 4 | 2.45 | 0.43 | 2.69 | 2.45 |
-| Qwen2.5-0.5B | 16 | 2.61 | 0.69 | 2.96 | 2.62 |
-| Qwen2.5-0.5B | 64 | 2.97 | 1.11 | 3.82 | 2.97 |
-| Qwen2.5-0.5B | 256 | 4.06 | 2.95 | 6.32 | 3.91 |
-| Qwen2.5-7B | 1 | 5.89 | 0.37 | 6.09 | 5.90 |
-| Qwen2.5-7B | 4 | 6.30 | 0.42 | 6.52 | 6.30 |
-| Qwen2.5-7B | 16 | 6.83 | 0.57 | 7.17 | 6.84 |
-| Qwen2.5-7B | 64 | 7.78 | 1.08 | 8.38 | 7.70 |
-| Qwen2.5-7B | 128 | 9.11 | 1.71 | 10.07 | 8.92 |
+| model | batch | GPU, unfused | GPU | engine CPU | step, sync | step, async |
+|---|---:|---:|---:|---:|---:|---:|
+| Qwen2.5-0.5B | 1 | 2.16 | 1.10 | 0.36 | 1.29 | 1.11 |
+| Qwen2.5-0.5B | 4 | 2.45 | 1.21 | 0.41 | 1.43 | 1.21 |
+| Qwen2.5-0.5B | 16 | 2.61 | 1.26 | 0.55 | 1.60 | 1.28 |
+| Qwen2.5-0.5B | 64 | 2.97 | 1.56 | 1.18 | 2.30 | 1.56 |
+| Qwen2.5-0.5B | 256 | 4.06 | 2.44 | 2.92 | 4.65 | 2.93 |
+| Qwen2.5-7B | 1 | 5.89 | 4.64 | 0.35 | 4.83 | 4.64 |
+| Qwen2.5-7B | 4 | 6.30 | 4.74 | 0.44 | 4.97 | 4.74 |
+| Qwen2.5-7B | 16 | 6.83 | 4.97 | 0.54 | 5.29 | 4.98 |
+| Qwen2.5-7B | 64 | 7.78 | 5.64 | 1.02 | 6.20 | 5.56 |
+| Qwen2.5-7B | 128 | 9.11 | 6.63 | 1.64 | 7.55 | 6.70 |
 
-- **Async scheduling turns a step's cost from CPU + GPU into about max(CPU, GPU):** 8% faster at batch 1, and 38% at batch 256 on 0.5B, where the CPU work (3 ms) nearly matches the GPU's (4 ms).
-- **At small batches the GPU work dominates, and most of it is not the model's math.** Kernel breakdown of one batch-1 decode step:
+- **Fused kernels halve the GPU time of a small 0.5B batch (2.16 to 1.10 ms at batch 1) and cut 7B's by 21% (5.89 to 4.64 ms).** Kernel breakdown of one batch-1 decode step:
 
-| model | kernel launches | GPU time | GEMMs | attention | other kernels |
-|---|---:|---:|---:|---:|---:|
-| Qwen2.5-0.5B | 1,153 | 2.19 ms | 0.61 ms | 0.21 ms | 1.37 ms (62%) |
-| Qwen2.5-7B | 1,369 | 5.92 ms | 3.88 ms | 0.33 ms | 1.72 ms (29%) |
+| model | kernels | launches | GPU time | GEMMs | attention | everything else |
+|---|---|---:|---:|---:|---:|---:|
+| Qwen2.5-0.5B | unfused | 1,153 | 2.19 ms | 0.61 ms | 0.21 ms | 1.37 ms (62%) |
+| Qwen2.5-0.5B | fused | 328 | 1.08 ms | 0.62 ms | 0.21 ms | 0.25 ms (23%) |
+| Qwen2.5-7B | unfused | 1,369 | 5.92 ms | 3.88 ms | 0.33 ms | 1.72 ms (29%) |
+| Qwen2.5-7B | fused | 408 | 4.68 ms | 3.95 ms | 0.32 ms | 0.40 ms (9%) |
 
-  On 0.5B, 62% of the GPU time goes to about a thousand small elementwise, copy and reduction kernels: RMSNorm, residual adds, rotary embeddings, SiLU and dtype casts, each written as several PyTorch ops. vLLM fuses these, which is most of why its per-token latency is lower at light load. Fusing them is the first roadmap item.
+  Unfused, RMSNorm, residual adds, rotary embeddings, SiLU and dtype casts ran as about a thousand small kernels and took 62% of a 0.5B step. Fused, everything besides the weight GEMMs and attention takes 0.25 ms: the fused kernels themselves, the K/V cache writes, and sampling.
+- **Async scheduling makes a step cost about max(CPU, GPU) instead of CPU + GPU.** With fusion the GPU part shrank enough that a large batch of a small model is now CPU-bound: at batch 256 on 0.5B the engine's CPU work (2.9 ms) exceeds the GPU's (2.4 ms), and the step takes the CPU's time. That is the first roadmap item.
 
 **Online serving** (Poisson arrivals, streaming, fresh prompts at every rate, load from 4 client processes).
 
@@ -248,60 +254,56 @@ Engines in a table ran back to back on the same GPU, with two exceptions, both c
 
 | offered req/s | engine | served req/s | output tok/s | TTFT p50 / p99 (ms) | TPOT p50 / p99 (ms) |
 |---:|---|---:|---:|---:|---:|
-| 8 | minillm | 7.0 | 898 | 14 / 33 | 2.5 / 2.9 |
-| 8 | minillm-sync | 7.0 | 898 | 14 / 29 | 2.9 / 3.5 |
-| 8 | vllm | 7.0 | 899 | 12 / 34 | 1.3 / 1.6 |
-| 16 | minillm | 14.0 | 1,787 | 14 / 32 | 2.7 / 3.1 |
-| 16 | minillm-sync | 13.9 | 1,785 | 14 / 24 | 3.2 / 3.8 |
-| 16 | vllm | 14.0 | 1,793 | 12 / 23 | 1.4 / 1.8 |
-| 32 | minillm | 29.2 | 3,740 | 16 / 36 | 3.2 / 3.9 |
-| 32 | minillm-sync | 29.1 | 3,731 | 15 / 25 | 4.0 / 5.1 |
-| 32 | vllm | 29.5 | 3,772 | 13 / 37 | 1.6 / 2.3 |
-| 64 | minillm | 57.1 | 7,314 | 25 / 142 | 4.3 / 5.5 |
-| 64 | minillm-sync | 56.8 | 7,273 | 18 / 92 | 5.9 / 8.2 |
-| 64 | vllm | 58.2 | 7,445 | 16 / 42 | 2.3 / 3.4 |
-| 128 | minillm | 111.3 | 14,244 | 37 / 57 | 7.2 / 7.6 |
-| 128 | minillm-sync | 95.3 | 12,199 | 33 / 55 | 9.6 / 10.2 |
-| 128 | vllm | 114.4 | 14,649 | 33 / 62 | 6.2 / 6.9 |
-| burst | minillm | 184.7 | 23,636 | 136 / 309 | 4.1 / 4.7 |
-| burst | minillm-sync | 143.0 | 18,302 | 75 / 278 | 6.2 / 6.7 |
-| burst | vllm | 181.2 | 23,192 | 105 / 186 | 4.6 / 5.0 |
+| 8 | minillm | 7.0 | 900 | 7 / 25 | 1.2 / 1.4 |
+| 8 | minillm-unfused | 7.0 | 898 | 14 / 33 | 2.5 / 2.9 |
+| 8 | vllm | 7.0 | 900 | 11 / 21 | 1.3 / 1.6 |
+| 16 | minillm | 14.0 | 1,794 | 7 / 15 | 1.2 / 1.4 |
+| 16 | minillm-unfused | 14.0 | 1,787 | 14 / 32 | 2.7 / 3.1 |
+| 16 | vllm | 14.0 | 1,794 | 13 / 27 | 1.4 / 1.9 |
+| 32 | minillm | 29.5 | 3,776 | 8 / 17 | 1.3 / 1.6 |
+| 32 | minillm-unfused | 29.2 | 3,741 | 15 / 35 | 3.2 / 4.0 |
+| 32 | vllm | 29.5 | 3,775 | 12 / 27 | 1.6 / 2.2 |
+| 64 | minillm | 58.3 | 7,460 | 11 / 31 | 1.6 / 2.0 |
+| 64 | minillm-unfused | 57.1 | 7,305 | 25 / 98 | 4.4 / 5.5 |
+| 64 | vllm | 58.2 | 7,454 | 16 / 32 | 2.4 / 3.2 |
+| 128 | minillm | 116.6 | 14,930 | 18 / 103 | 3.4 / 4.7 |
+| 128 | minillm-unfused | 112.0 | 14,332 | 38 / 61 | 6.7 / 7.4 |
+| 128 | vllm | 115.2 | 14,751 | 35 / 69 | 5.9 / 7.1 |
+| burst | minillm | 282.1 | 36,111 | 82 / 152 | 2.7 / 3.5 |
+| burst | minillm-unfused | 191.2 | 24,471 | 134 / 237 | 4.0 / 4.8 |
+| burst | vllm | 187.1 | 23,948 | 150 / 203 | 4.2 / 4.7 |
 
 **Qwen2.5-7B, online** (500 requests per point)
 
 | offered req/s | engine | served req/s | output tok/s | TTFT p50 / p99 (ms) | TPOT p50 / p99 (ms) |
 |---:|---|---:|---:|---:|---:|
-| 4 | minillm | 3.5 | 449 | 29 / 54 | 6.6 / 7.3 |
-| 4 | minillm-sync | 3.5 | 448 | 25 / 51 | 7.1 / 8.2 |
-| 4 | vllm | 3.5 | 449 | 23 / 47 | 5.0 / 5.3 |
-| 8 | minillm | 7.0 | 892 | 31 / 51 | 7.2 / 8.1 |
-| 8 | minillm-sync | 7.0 | 891 | 26 / 49 | 7.8 / 8.8 |
-| 8 | vllm | 7.0 | 894 | 23 / 52 | 5.2 / 5.7 |
-| 16 | minillm | 14.6 | 1,863 | 35 / 63 | 8.6 / 10.2 |
-| 16 | minillm-sync | 14.5 | 1,861 | 29 / 65 | 9.5 / 11.5 |
-| 16 | vllm | 14.6 | 1,873 | 25 / 56 | 5.8 / 6.6 |
-| 32 | minillm | 28.3 | 3,625 | 52 / 154 | 13.3 / 17.3 |
-| 32 | minillm-sync | 28.2 | 3,614 | 51 / 154 | 19.1 / 22.8 |
-| 32 | vllm | 28.7 | 3,670 | 30 / 65 | 7.2 / 8.6 |
-| 64 | minillm | 41.4 | 5,303 | 247 / 501 | 21.5 / 23.3 |
-| 64 | minillm-sync | 38.9 | 4,974 | 249 / 433 | 23.3 / 25.4 |
-| 64 | vllm | 53.6 | 6,860 | 106 / 291 | 16.5 / 17.7 |
-| burst | minillm | 42.8 | 5,482 | 696 / 1774 | 17.6 / 21.8 |
-| burst | minillm-sync | 39.6 | 5,068 | 465 / 1790 | 21.5 / 25.0 |
-| burst | vllm | 54.7 | 6,999 | 590 / 1433 | 13.3 / 17.8 |
+| 4 | minillm | 3.5 | 449 | 20 / 75 | 4.8 / 5.2 |
+| 4 | minillm-unfused | 3.5 | 449 | 29 / 49 | 6.6 / 7.3 |
+| 4 | vllm | 3.5 | 449 | 22 / 37 | 5.0 / 5.3 |
+| 8 | minillm | 7.0 | 894 | 21 / 34 | 5.0 / 5.5 |
+| 8 | minillm-unfused | 7.0 | 892 | 31 / 49 | 7.2 / 8.1 |
+| 8 | vllm | 7.0 | 894 | 23 / 36 | 5.2 / 5.6 |
+| 16 | minillm | 14.6 | 1,875 | 23 / 43 | 5.6 / 6.6 |
+| 16 | minillm-unfused | 14.6 | 1,863 | 35 / 64 | 8.6 / 10.3 |
+| 16 | vllm | 14.6 | 1,874 | 24 / 58 | 5.7 / 6.6 |
+| 32 | minillm | 28.7 | 3,676 | 29 / 76 | 7.5 / 10.4 |
+| 32 | minillm-unfused | 28.3 | 3,624 | 53 / 148 | 13.7 / 18.2 |
+| 32 | vllm | 28.7 | 3,671 | 29 / 65 | 7.2 / 8.5 |
+| 64 | minillm | 49.0 | 6,276 | 127 / 270 | 18.6 / 20.1 |
+| 64 | minillm-unfused | 41.4 | 5,296 | 245 / 449 | 21.6 / 23.4 |
+| 64 | vllm | 54.0 | 6,906 | 91 / 200 | 16.6 / 17.7 |
+| burst | minillm | 54.8 | 7,019 | 726 / 1446 | 13.1 / 18.0 |
+| burst | minillm-unfused | 43.0 | 5,503 | 696 / 1777 | 17.6 / 21.8 |
+| burst | vllm | 55.0 | 7,038 | 676 / 1452 | 13.2 / 17.1 |
 
 
-- **Async scheduling lowers per-token latency at every load.** On 0.5B it falls from 2.9 to 2.5 ms at 8 req/s, 5.9 to 4.3 ms at 64 req/s and 9.6 to 7.2 ms at 128 req/s, and burst throughput rises 29% (18.3k to 23.6k tok/s). On 7B latency falls from 7.1 to 6.6 ms at 4 req/s and 19.1 to 13.3 ms at 32 req/s, and burst throughput rises 8%.
-- **It costs time to first token.** A request that arrives while a step runs now waits for the step already launched behind it too.
-  - At light load that is about one decode step: on 7B, median TTFT goes from 25 to 29 ms at 4 req/s; on 0.5B it is unchanged.
-  - Under a burst it is larger: on 7B, median TTFT rose from 465 to 696 ms. Four repeat runs in two more jobs reproduced it (622–653 vs 456–481 ms).
-  - The engine alone shows no such cost: on the fake executor, fed 500 requests at once without HTTP, async scheduling is faster at every percentile. Collecting prompt-heavy steps before scheduling more work did not recover it either (tested on the H200). The cause is still open.
-  - `--no-async-scheduling` restores synchronous scheduling for TTFT-critical bursty traffic.
-- **Against vLLM, under load:** on 0.5B, minillm's burst throughput is level with vLLM's in the same job (23.6k vs 23.2k tok/s; vLLM measured 29.4k in an earlier job, so call it 80–100%). On 7B it is 78% (5.5k vs 7.0k tok/s).
-- **At light load, vLLM is still faster per token:** 1.3 vs 2.5 ms on 0.5B, 5.0 vs 6.6 ms on 7B. The profile above shows why: small unfused kernels on the GPU, not CPU overhead.
-- **A single client process skews the results.** With one client process, vLLM's 0.5B burst measured 9.8k tok/s; with four it measures 29.4k. One process tops out near 10k streamed tokens/s and inflates burst TTFT.
-- **CUDA graphs matter online too:** without them, minillm's 0.5B per-token latency at light load is 11.4 ms instead of about 3 (before async scheduling).
-- **Shared 1,024-token system prompt at 16 req/s:** with prefix caching, median TTFT is 15 ms (minillm) vs 11 ms (vLLM) on 0.5B, and 26 vs 18 ms on 7B.
+- **Fused kernels roughly halve per-token latency on 0.5B at every load.** It falls from 2.5 to 1.2 ms at 8 req/s, 4.4 to 1.6 ms at 64 req/s and 6.7 to 3.4 ms at 128 req/s, and burst throughput rises 48%. On 7B, latency falls from 6.6 to 4.8 ms at 4 req/s and 13.7 to 7.5 ms at 32 req/s, and burst throughput rises 28%. Time to first token drops too (14 to 7 ms on 0.5B, 29 to 20 ms on 7B at light load): prompt steps run the fused kernels as well.
+- **Against vLLM, 0.5B: minillm is ahead at every load.** Per-token latency is 1.18 vs 1.27 ms at 8 req/s, 1.60 vs 2.36 ms at 64 and 3.43 vs 5.86 ms at 128. Time to first token is 7 vs 11 ms at light load. Burst throughput is 36.1k vs 23.9k tok/s, 1.5× vLLM's figure in this job and 1.2× its best in any job.
+- **Against vLLM, 7B: level at light load and under a burst, behind in between.** At 4 req/s per-token latency is 4.83 vs 4.98 ms and time to first token 20 vs 22 ms. Burst throughput is 7.02k vs 7.04k tok/s. At 32 req/s latency is 7.5 vs 7.2 ms, and at 64 req/s minillm serves 91% of vLLM's throughput (6.3k vs 6.9k tok/s) with higher TTFT (127 vs 91 ms).
+- **Async scheduling's time-to-first-token cost under bursts remains.** When it was introduced, 7B's median burst TTFT rose from about 470 to 650 ms against synchronous scheduling, reproduced in five runs. Here it is 726 ms vs vLLM's 676. The engine alone does not show it (see the async-scheduling notes above), and its cause is still open. `--no-async-scheduling` restores synchronous scheduling for TTFT-critical bursty traffic.
+- **Shared 1,024-token system prompt at 16 req/s:** with prefix caching, median TTFT is 7.5 ms (minillm) vs 10.8 ms (vLLM) on 0.5B, and 16.6 vs 17.9 ms on 7B.
+- **A single client process skews the results.** With one client process, vLLM's 0.5B burst measured 9.8k tok/s; with four it measures 23–29k. One process tops out near 10k streamed tokens/s and inflates burst TTFT.
+- **CUDA graphs matter online too:** without them, minillm's 0.5B per-token latency at light load was 11.4 ms instead of about 3 (measured before async scheduling and fused kernels).
 
 ### Reproducing
 
@@ -334,7 +336,7 @@ minillm/
   executor/cuda_graphs.py    decode CUDA graphs (FlashInfer)
   executor/fake.py           deterministic executor and byte tokenizer for tests and CI
   models/llama.py, loader.py model implementation, safetensors loading
-  layers/attention.py, sampler.py
+  layers/attention.py, fused.py, sampler.py
   entrypoints/openai_server.py, protocol.py
 benchmarks/  bench_offline.py, bench_serving.py, fake_server.py, profile_step.py
 scripts/     report.py, readme_tables.py
@@ -345,7 +347,7 @@ tests/
 
 ## Roadmap
 
-1. **Fuse the small kernels.** At batch 1, a 0.5B decode step spends 62% of its GPU time (1.4 of 2.2 ms) in about a thousand small elementwise, copy and reduction kernels: RMSNorm, residual adds, rotary embeddings, SiLU and dtype casts, each written as several PyTorch ops. FlashInfer already ships fused kernels for all of them (`fused_add_rmsnorm`, `apply_rope_with_cos_sin_cache_inplace`, `silu_and_mul`), as used by SGLang. This, not CPU overhead, is what separates minillm from vLLM at light load.
+1. **Cut the engine's CPU time per step.** With the kernels fused, large batches of a small model are CPU-bound again: at batch 256 on 0.5B the engine spends 2.9 ms of CPU per step against 2.4 ms of GPU work. Most of it is Python building per-token input lists and FlashInfer page tables from scratch each step; keeping them in preallocated arrays and updating them incrementally, as vLLM does, would remove most of that.
 2. **CUDA graphs for mixed steps.** Steps that contain prompt chunks still run eagerly, which is part of why the variable-length workload trails vLLM by more than the uniform one. vLLM captures everything except attention ("piecewise" graphs).
 3. **Speculative decoding** (n-gram / prompt lookup first) and **4-bit weights**, using the W4A16 Triton kernel from Quantized-inference-lab.
 4. **Container image** built and smoke-tested in CI on a GPU runner.
