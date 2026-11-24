@@ -3,9 +3,9 @@
     python scripts/readme_tables.py            # markdown for the Benchmarks section
 
 results/h200-final-<model> holds the final run per model (scripts/explorer/bench.sh,
-then the step profile, 4-bit accuracy and memory). HF `generate` comes from the
-earlier run in results/h200-<model>, and the fused-vs-unfused kernel breakdown
-from results/h200-profile. results/h200-spec holds benchmarks/bench_spec.py output.
+then the step profile, 4-bit accuracy and memory). The fused-vs-unfused kernel
+breakdown comes from results/h200-profile, and results/h200-spec holds
+benchmarks/bench_spec.py output.
 """
 
 from __future__ import annotations
@@ -19,10 +19,10 @@ import sys
 from typing import Any
 
 ROOT = os.path.join(os.path.dirname(__file__), "..", "results")
-# (name, final run, earlier run with the HF baseline and the unfused profile)
+# (name, final run, name of the model's runs in results/h200-profile)
 MODELS = [
-    ("Qwen2.5-0.5B", "h200-final-qwen2.5-0.5b", "h200-qwen2.5-0.5b"),
-    ("Qwen2.5-7B", "h200-final-qwen2.5-7b", "h200-qwen2.5-7b"),
+    ("Qwen2.5-0.5B", "h200-final-qwen2.5-0.5b", "qwen2.5-0.5b"),
+    ("Qwen2.5-7B", "h200-final-qwen2.5-7b", "qwen2.5-7b"),
 ]
 ENGINE_ORDER = ["minillm", "minillm-sync", "minillm-w4a16", "vllm"]
 ENGINE_LABEL = {
@@ -63,10 +63,10 @@ def offline_table() -> str:
         "| minillm vs HF | minillm vs vLLM | 4-bit vs 16-bit |",
         "|---|---|---:|---:|---:|---:|---:|---:|---:|",
     ]
-    for name, final, early in MODELS:
+    for name, final, _ in MODELS:
         for r, label in (("0", "uniform lengths"), ("0.9", "lengths vary ±90%")):
             m, w4 = tput(final, "minillm", r), tput(final, "minillm-w4a16", r)
-            hf, vllm = tput(early, "hf", r), tput(final, "vllm", r)
+            hf, vllm = tput(final, "hf", r), tput(final, "vllm", r)
             rows.append(
                 f"| {name} | {label} | {fmt(m)} | {fmt(w4)} | {fmt(hf)} | {fmt(vllm)} "
                 f"| {ratio(m, hf, pct=False)} | {ratio(m, vllm)} | {ratio(w4, m)} |"
@@ -119,10 +119,10 @@ def kernel_table_fusion() -> str:
         "| model | kernels | launches | GPU time | GEMMs | attention | everything else |",
         "|---|---|---:|---:|---:|---:|---:|",
     ]
-    for (name, _, early), (variant, label) in itertools.product(
+    for (name, _, profile), (variant, label) in itertools.product(
         MODELS, (("-unfused", "unfused"), ("", "fused"))
     ):
-        rows += kernel_rows(name, label, load("h200-profile", f"{early[5:]}{variant}.json"))
+        rows += kernel_rows(name, label, load("h200-profile", f"{profile}{variant}.json"))
     return "\n".join(rows)
 
 
@@ -205,20 +205,22 @@ def spec_table() -> str:
 
 def quant_table() -> str:
     rows = [
-        "| model | weights, 16-bit → 4-bit | KV cache, 16-bit → 4-bit (tokens) "
+        "| model | weights, 16-bit → 4-bit | KV-cache tokens the saving holds "
         "| WikiText-2 perplexity, 16-bit → 4-bit | next-token agreement |",
         "|---|---:|---:|---:|---:|",
     ]
     for name, final, _ in MODELS:
-        e, mem = load(final, "eval_quant.json"), load(final, "memory.json") or {}
+        e, mem = load(final, "eval_quant.json"), load(final, "memory.json")
         if not e:
             continue
-        b, q = mem.get("minillm", {}), mem.get("minillm-w4a16", {})
-        weights = f"{b['weights_gib']:.2f} → {q['weights_gib']:.2f} GiB" if b and q else "–"
-        kv = f"{b['kv_tokens'] / 1e6:.2f}M → {q['kv_tokens'] / 1e6:.2f}M" if b and q else "–"
+        weights = kv = "–"
+        if mem:
+            w16, w4 = mem["weights_gib"]["minillm"], mem["weights_gib"]["minillm-w4a16"]
+            weights = f"{w16:.2f} → {w4:.2f} GiB"
+            kv = f"{(w16 - w4) * 2**30 / mem['kv_bytes_per_token'] / 1e3:,.0f}k"
         rows.append(
             f"| {name} | {weights} | {kv} | {e['bf16_perplexity']:.2f} → "
-            f"{e['w4a16_perplexity']:.2f} (+{100 * e['perplexity_increase']:.1f}%) "
+            f"{e['w4a16_perplexity']:.2f} (+{100 * e['perplexity_increase']:.0f}%) "
             f"| {100 * e['top1_agreement']:.1f}% |"
         )
     return "\n".join(rows)

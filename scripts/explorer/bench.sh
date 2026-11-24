@@ -6,8 +6,9 @@
 #      --enforce-eager), WORKERS (load-generator processes, default 4).
 #      minillm variants (ENGINES and SERVE_ENGINES): minillm-sync waits for each step's
 #      tokens before scheduling the next (--no-async-scheduling); minillm-unfused runs
-#      norms/rotary/SiLU as PyTorch ops (--no-fused-kernels); minillm-1proc (online
-#      only) runs the engine on a thread in the API process.
+#      norms/rotary/SiLU as PyTorch ops (--no-fused-kernels); minillm-w4a16 runs 4-bit
+#      weights (--quantization w4a16); minillm-1proc (online only) runs the engine on a
+#      thread in the API process.
 #      Results: $ROOT/results/<tag>/ + REPORT.md.
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
