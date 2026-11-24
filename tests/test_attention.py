@@ -147,3 +147,35 @@ def test_cacheless_path_matches_dense() -> None:
     out = torch_attention(torch.cat(qs), torch.cat(ks), torch.cat(vs), None, None, meta, 0.25)
     ref = torch.cat([dense_reference(q, k, v, 0.25) for q, k, v in zip(qs, ks, vs, strict=True)])
     torch.testing.assert_close(out, ref, rtol=1e-5, atol=1e-5)
+
+
+def test_combined_kv_write_matches_separate_writes() -> None:
+    """The fused path writes K and V with one kernel, from a [tokens, 2, heads, dim]
+    view of the qkv buffer; it must land exactly where two separate writes would."""
+    from minillm.layers.attention import PagedAttention
+
+    layers, blocks, bs, heads, dim, tokens = 3, 5, 4, 2, 8, 6
+    pool = torch.zeros(2, layers, blocks, bs, heads, dim)
+    expected = pool.clone()
+    qkv = torch.randn(tokens, 4 * dim + 2 * heads * dim)
+    kv = qkv[:, 4 * dim :].view(tokens, 2, heads, dim)
+    slots = torch.tensor([3, 7, 0, 17, 18, 19])
+    attn = PagedAttention(4, heads, dim, scale=dim**-0.5)
+    attn.k_cache, attn.v_cache, attn.kv_cache = pool[0, 1], pool[1, 1], pool[:, 1]
+    meta = AttentionMetadata(
+        backend="torch",
+        num_seqs=1,
+        max_seqlen_q=tokens,
+        max_seqlen_k=20,
+        query_lens=torch.tensor([tokens], dtype=torch.int32),
+        seq_lens_k=torch.tensor([20], dtype=torch.int32),
+        cu_seqlens_q=torch.tensor([0, tokens], dtype=torch.int32),
+        cu_seqlens_k=torch.tensor([0, 20], dtype=torch.int32),
+        slot_mapping=slots,
+        block_tables=torch.arange(blocks, dtype=torch.int32)[None],
+        decode_only=False,
+    )
+    q = torch.randn(tokens, 4, dim)
+    attn(q, kv[:, 0], kv[:, 1], meta, kv=kv)
+    write_kv_cache(kv[:, 0], kv[:, 1], expected[0, 1], expected[1, 1], slots)
+    assert torch.equal(pool, expected)

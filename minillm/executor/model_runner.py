@@ -12,8 +12,9 @@ import torch
 
 from minillm.config import EngineConfig
 from minillm.executor.base import DoneStep, StepHandle
+from minillm.executor.block_tables import DeviceBlockTables
 from minillm.executor.cuda_graphs import DecodeGraphs
-from minillm.layers.attention import AttentionMetadata, FlashInferPlanner
+from minillm.layers.attention import AttentionMetadata, FlashInferPlanner, pinned_views
 from minillm.layers.sampler import is_greedy, sample
 from minillm.models.llama import ModelConfig
 from minillm.models.loader import (
@@ -82,15 +83,20 @@ def resolve_backend(name: str, device: torch.device) -> str:
 
 @dataclass
 class _Batch:
-    """One step's inputs: host lists, then the device tensors made from them."""
+    """One step's inputs as host lists, O(sequences) apart from prompt tokens.
+
+    Per-token positions and KV slots, and FlashInfer's page lists, are computed
+    on the device from these (see block_tables.py); ``dev`` holds the results.
+    """
 
     num_seqs: int
     input_ids: list[int] = field(default_factory=list)
-    positions: list[int] = field(default_factory=list)
-    slots: list[int] = field(default_factory=list)
+    starts: list[int] = field(default_factory=list)  # first position each sequence computes
     query_lens: list[int] = field(default_factory=list)
     seq_lens: list[int] = field(default_factory=list)
-    tables: list[list[int]] = field(default_factory=list)
+    rows: list[int] = field(default_factory=list)  # block-table row of each sequence
+    tables: list[list[int]] = field(default_factory=list)  # the block manager's tables
+    slots: list[int] = field(default_factory=list)  # KV slot per sequence (decode steps)
     sample_rows: list[int] = field(default_factory=list)  # flat index of each sampler's last input
     sampling: list[Sequence] = field(default_factory=list)
     temps: list[float] = field(default_factory=list)
@@ -100,11 +106,18 @@ class _Batch:
     # GPU), and that token's row in the previous step's output.
     pending_dst: list[int] = field(default_factory=list)
     pending_src: list[int] = field(default_factory=list)
+    # Block-table entries the device does not have yet.
+    table_rows: list[int] = field(default_factory=list)
+    table_cols: list[int] = field(default_factory=list)
+    table_vals: list[int] = field(default_factory=list)
+    # FlashInfer's page layout, possibly padded to a CUDA-graph batch size.
+    indptr: list[int] = field(default_factory=list)
+    last_page_len: list[int] = field(default_factory=list)
     dev: dict[str, torch.Tensor] = field(default_factory=dict)
 
     @property
     def decode_only(self) -> bool:
-        return max(self.query_lens) == 1
+        return len(self.input_ids) == self.num_seqs
 
 
 class _CudaStep:
@@ -175,9 +188,16 @@ class ModelRunner:
         # sequence's row in them: the next step may need them as inputs.
         self._prev_tokens: torch.Tensor | None = None
         self._prev_rows: dict[Sequence, int] = {}
-        # FlashInfer reads pages through its planned wrapper, not a block-table
-        # tensor; this empty one only marks that the KV cache is in use.
+        # FlashInfer reads pages through its planned wrapper, not block tables or
+        # length tensors; these empty ones fill the metadata fields it ignores.
         self._cache_marker = torch.empty(0, 0, dtype=torch.int32, device=self.device)
+        self._unused = torch.empty(0, dtype=torch.int32, device=self.device)
+        self.block_tables = DeviceBlockTables(
+            config.max_num_seqs,
+            cdiv(self.max_model_len, self.block_size),
+            self.scratch_block,
+            self.device,
+        )
 
         # Decode CUDA graphs: CUDA + FlashInfer only (its decode kernel supports capture).
         self.graphs: DecodeGraphs | None = None
@@ -239,6 +259,7 @@ class ModelRunner:
         for i, attn in enumerate(self.model.attention_layers):
             attn.k_cache = kv[0, i]
             attn.v_cache = kv[1, i]
+            attn.kv_cache = kv[:, i]
         self.kv_cache = kv
         logger.info(
             "KV cache: %d blocks x %d tokens = %d tokens (%.2f GiB), max_model_len=%d",
@@ -340,19 +361,22 @@ class ModelRunner:
         hidden = self._run_model(batch)
         if not batch.sampling:
             return None
-        logits: torch.Tensor = self.model.compute_logits(hidden[batch.dev["rows"]]).float()
+        logits: torch.Tensor = self.model.compute_logits(hidden[batch.dev["sample_rows"]]).float()
         return logits
 
     def _prepare(self, scheduled: list[ScheduledSeq]) -> _Batch:
         bs = self.block_size
         batch = _Batch(num_seqs=len(scheduled))
+        tables = self.block_tables
+        tables.begin_step()
+        ids = batch.input_ids
         for item in scheduled:
             seq = item.seq
             start = item.start
             end = start + item.num_new_tokens
             known = len(seq.token_ids)
             if end <= known:
-                batch.input_ids.extend(seq.token_ids[start:end])
+                ids.extend(seq.token_ids[start:end])
             else:
                 # The last input is the token the previous step sampled for this
                 # sequence; the CPU has not seen it. Leave a hole to fill on the GPU.
@@ -362,23 +386,19 @@ class ModelRunner:
                         f"{seq.request_id}: input position {end - 1} is neither known to "
                         "the CPU nor a token the previous step sampled"
                     )
-                batch.input_ids.extend(seq.token_ids[start:known])
-                batch.pending_dst.append(len(batch.input_ids))
+                ids.extend(seq.token_ids[start:known])
+                batch.pending_dst.append(len(ids))
                 batch.pending_src.append(row)
-                batch.input_ids.append(0)
-            batch.positions.extend(range(start, end))
-            pos = start
-            while pos < end:  # one contiguous slot range per block
-                block_idx, offset = divmod(pos, bs)
-                span = min(bs - offset, end - pos)
-                base = seq.block_table[block_idx] * bs + offset
-                batch.slots.extend(range(base, base + span))
-                pos += span
+                ids.append(0)
+            batch.starts.append(start)
             batch.query_lens.append(end - start)
             batch.seq_lens.append(end)
-            batch.tables.append(seq.block_table)
+            table = seq.block_table
+            batch.tables.append(table)
+            batch.slots.append(table[start // bs] * bs + start % bs)  # used if decode-only
+            batch.rows.append(tables.row(seq, batch.table_rows, batch.table_cols, batch.table_vals))
             if item.sample:
-                batch.sample_rows.append(len(batch.input_ids) - 1)
+                batch.sample_rows.append(len(ids) - 1)
                 batch.sampling.append(seq)
                 params = seq.params
                 batch.temps.append(params.temperature)
@@ -400,14 +420,89 @@ class ModelRunner:
             offset += len(part)
         return views
 
-    def _upload_ints(self, batch: _Batch, *leading: list[int]) -> list[torch.Tensor]:
-        """One copy for the step's int64 inputs: ``leading`` lists, then the
-        sampling rows, top-k values and pending-token indices (kept in ``batch.dev``)."""
-        names = ("rows", "top_ks", "pending_dst", "pending_src")
-        extras = [batch.sample_rows, batch.top_ks, batch.pending_dst, batch.pending_src]
-        views = self._upload([*leading, *extras], torch.long)
-        batch.dev.update(zip(names, views[len(leading) :], strict=True))
-        return views[: len(leading)]
+    # Up to this many pages, FlashInfer's page list is built in Python; beyond it,
+    # on the device from the block tables. Small lists cost less to build here than
+    # the extra kernels cost the GPU; large ones (a big decode batch with long
+    # contexts: tens of thousands of entries) the other way round.
+    HOST_PAGES_MAX = 4096
+
+    def _upload_inputs(self, batch: _Batch, padded: int, graph: bool = False) -> None:
+        """Send the step's inputs to the device and lay out FlashInfer's pages.
+
+        Decode steps carry one token per sequence, so positions and KV slots are
+        computed here. Steps with prompt chunks can carry thousands of tokens:
+        their positions and slots are computed on the device from the block
+        tables. ``padded`` >= num_seqs adds scratch-page rows for a CUDA-graph
+        batch, whose graph copies the inputs into its own buffers (``graph``).
+        """
+        bs, n = self.block_size, batch.num_seqs
+        pad = padded - n
+        pages = [(length + bs - 1) // bs for length in batch.seq_lens]
+        indptr = [0]
+        for p in pages:
+            indptr.append(indptr[-1] + p)
+        for _ in range(pad):
+            indptr.append(indptr[-1] + 1)
+        batch.indptr = indptr
+        batch.last_page_len = [
+            length - (p - 1) * bs for length, p in zip(batch.seq_lens, pages, strict=True)
+        ] + [1] * pad
+        decode = batch.decode_only
+        device_pages = self.flashinfer is not None and indptr[-1] > self.HOST_PAGES_MAX
+
+        parts: dict[str, list[int]] = {}
+        if not graph:
+            parts["ids"] = batch.input_ids
+            if decode:
+                parts["positions"] = batch.starts
+                parts["slots"] = batch.slots
+        if not decode:
+            qstart = [0] * n
+            for i in range(1, n):
+                qstart[i] = qstart[i - 1] + batch.query_lens[i - 1]
+            parts["starts"], parts["qlens"], parts["qstart"] = (
+                batch.starts,
+                batch.query_lens,
+                qstart,
+            )
+        if not decode or device_pages or self.flashinfer is None:
+            parts["rows"] = batch.rows + [self.block_tables.pad_row] * pad
+        if device_pages:
+            parts["pages"] = pages + [1] * pad
+            parts["page_start"] = indptr[:-1]
+        parts.update(
+            table_rows=batch.table_rows,
+            table_cols=batch.table_cols,
+            table_vals=batch.table_vals,
+            sample_rows=batch.sample_rows,
+            top_ks=batch.top_ks,
+            pending_dst=batch.pending_dst,
+            pending_src=batch.pending_src,
+        )
+        dev = batch.dev
+        dev.update(zip(parts, self._upload(list(parts.values()), torch.long), strict=True))
+        tables = self.block_tables
+        tables.write(dev["table_rows"], dev["table_cols"], dev["table_vals"])
+        if not decode:
+            total = len(batch.input_ids)
+            seq = torch.repeat_interleave(
+                torch.arange(n, device=self.device), dev["qlens"], output_size=total
+            )
+            positions = dev["starts"][seq] + torch.arange(total, device=self.device)
+            positions -= dev["qstart"][seq]
+            dev["positions"] = positions
+            dev["slots"] = tables.slots(dev["rows"][seq], positions, bs)
+        if self.flashinfer is None:
+            return
+        if device_pages:
+            dev["page_indices"] = tables.page_indices(
+                dev["rows"], dev["pages"], dev["page_start"], indptr[-1]
+            )
+        else:
+            flat = [b for table, p in zip(batch.tables, pages, strict=True) for b in table[:p]]
+            flat += [self.scratch_block] * pad
+            (indices,) = pinned_views([flat], torch.int32, pin=self._pin)
+            dev["page_indices"] = indices.to(self.device, non_blocking=True)
 
     def gather_pending(self, input_ids: torch.Tensor, batch: _Batch) -> None:
         """Fill in input tokens the previous step sampled, straight from device memory."""
@@ -417,47 +512,55 @@ class ModelRunner:
             input_ids.index_copy_(0, batch.dev["pending_dst"], tokens)
 
     def _run_model(self, batch: _Batch) -> torch.Tensor:
-        if self.graphs is not None and batch.decode_only and self.graphs.can_run(batch.num_seqs):
-            self._upload_ints(batch)
-            return self.graphs.run(batch)
+        graphs = self.graphs
+        if graphs is not None and batch.decode_only and graphs.can_run(batch.num_seqs):
+            self._upload_inputs(batch, graphs.padded_size(batch.num_seqs), graph=True)
+            return graphs.run(batch)
+        self._upload_inputs(batch, batch.num_seqs)
         return self._eager_forward(batch)
 
     def _eager_forward(self, batch: _Batch) -> torch.Tensor:
-        ids, positions, slots = self._upload_ints(
-            batch, batch.input_ids, batch.positions, batch.slots
-        )
+        dev, n = batch.dev, batch.num_seqs
+        ids = dev["ids"]
         self.gather_pending(ids, batch)
-        cu_q, cu_k = [0], [0]
-        for q_len, k_len in zip(batch.query_lens, batch.seq_lens, strict=True):
-            cu_q.append(cu_q[-1] + q_len)
-            cu_k.append(cu_k[-1] + k_len)
-        parts = [batch.query_lens, batch.seq_lens, cu_q, cu_k]
-        width = max(len(t) for t in batch.tables)
-        if self.flashinfer is None:  # the torch and flash-attn kernels take block tables
-            parts.append([x for t in batch.tables for x in (*t, *[0] * (width - len(t)))])
-        views = self._upload(parts, torch.int32)
+        if self.flashinfer is not None:
+            lens: list[torch.Tensor] = [self._unused] * 4
+            tables = self._cache_marker
+        else:  # the torch and flash-attn kernels take lengths and block tables
+            cu_q, cu_k = [0], [0]
+            for q_len, k_len in zip(batch.query_lens, batch.seq_lens, strict=True):
+                cu_q.append(cu_q[-1] + q_len)
+                cu_k.append(cu_k[-1] + k_len)
+            lens = self._upload([batch.query_lens, batch.seq_lens, cu_q, cu_k], torch.int32)
+            width = max(batch.indptr[i + 1] - batch.indptr[i] for i in range(n))
+            tables = self.block_tables.table[dev["rows"], :width]
         meta = AttentionMetadata(
             backend=self.backend,
-            num_seqs=batch.num_seqs,
+            num_seqs=n,
             max_seqlen_q=max(batch.query_lens),
             max_seqlen_k=max(batch.seq_lens),
-            query_lens=views[0],
-            seq_lens_k=views[1],
-            cu_seqlens_q=views[2],
-            cu_seqlens_k=views[3],
-            slot_mapping=slots,
-            block_tables=views[4].view(batch.num_seqs, width)
-            if self.flashinfer is None
-            else self._cache_marker,
+            query_lens=lens[0],
+            seq_lens_k=lens[1],
+            cu_seqlens_q=lens[2],
+            cu_seqlens_k=lens[3],
+            slot_mapping=dev["slots"],
+            block_tables=tables,
             decode_only=batch.decode_only,
         )
         if self.flashinfer is not None:
-            meta.flashinfer = self.flashinfer.plan(batch.tables, batch.seq_lens, batch.query_lens)
-        hidden: torch.Tensor = self.model(ids, positions, meta)
+            qo_indptr = None
+            if not batch.decode_only:
+                qo_indptr = [0]
+                for q_len in batch.query_lens:
+                    qo_indptr.append(qo_indptr[-1] + q_len)
+            meta.flashinfer = self.flashinfer.plan_layout(
+                batch.indptr, dev["page_indices"], batch.last_page_len, qo_indptr
+            )
+        hidden: torch.Tensor = self.model(ids, dev["positions"], meta)
         return hidden
 
     def _sample(self, hidden: torch.Tensor, batch: _Batch) -> torch.Tensor:
-        logits = self.model.compute_logits(hidden[batch.dev["rows"]]).float()
+        logits = self.model.compute_logits(hidden[batch.dev["sample_rows"]]).float()
         if all(is_greedy(t) for t in batch.temps):
             tokens: torch.Tensor = logits.argmax(dim=-1)
             return tokens

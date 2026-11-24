@@ -137,14 +137,13 @@ class Scheduler:
                 i += 1
                 continue
             n = min(seq.num_tokens - seq.num_computed_tokens, budget)
-            while not bm.can_allocate(seq, n):
+            while not bm.try_allocate(seq, n):
                 victim = self.running.pop()
                 self._preempt(victim)
                 preempted.append(victim)
                 if victim is seq:
                     break
             else:
-                bm.allocate(seq, n)
                 scheduled.append(self._commit(seq, n))
                 budget -= n
                 i += 1
@@ -201,21 +200,30 @@ class Scheduler:
         tokens = iter(sampled)
         events: list[TokenEvent] = []
         any_finished = False
+        bm = self.block_manager
+        caching, bs = bm.enable_prefix_caching, bm.block_size
+        running, finished = SequenceStatus.RUNNING, SequenceStatus.FINISHED
         for s in output.scheduled:
             seq = s.seq
             if not s.sample:
-                if seq.status is SequenceStatus.RUNNING:
-                    self.block_manager.cache_full_blocks(seq)
+                if seq.status is running and caching:
+                    bm.cache_full_blocks(seq)
                 continue
             token = next(tokens)
             seq.num_pending_tokens -= 1
-            if seq.is_finished:
+            if seq.status is finished:
                 # Aborted while the step ran, or (async) stopped on the previous
                 # step's token: this one is the discarded extra.
                 continue
             gap = seq.append_token(token, now)
-            if seq.status is SequenceStatus.RUNNING:  # not preempted meanwhile
-                self.block_manager.cache_full_blocks(seq)
+            # Register newly full blocks (cheap check first: most steps fill none).
+            if (
+                caching
+                and seq.status is running  # not preempted meanwhile
+                and min(seq.num_computed_tokens, len(seq.token_ids))
+                >= (len(seq.block_hashes) + 1) * bs
+            ):
+                bm.cache_full_blocks(seq)
             events.append(TokenEvent(seq, token, gap))
             reason = self._stop_reason(seq)
             if reason is not None:

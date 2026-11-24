@@ -148,6 +148,22 @@ class BlockManager:
         for _ in range(self._num_new_blocks(seq, num_new_tokens, 0)):
             seq.block_table.append(self._take_free_block())
 
+    def try_allocate(self, seq: Sequence, num_new_tokens: int) -> bool:
+        """``allocate`` for a sequence already holding blocks, if the blocks are free.
+
+        The scheduler's hot path: a decoding sequence needs a new block only once
+        every ``block_size`` steps, so most calls return without touching the pool.
+        """
+        bs = self.block_size
+        need = (seq.num_computed_tokens + num_new_tokens + bs - 1) // bs - len(seq.block_table)
+        if need <= 0:
+            return True
+        if need > len(self._free):
+            return False
+        for _ in range(need):
+            seq.block_table.append(self._take_free_block())
+        return True
+
     def _take_free_block(self) -> int:
         block_id, _ = self._free.popitem(last=False)
         block = self.blocks[block_id]

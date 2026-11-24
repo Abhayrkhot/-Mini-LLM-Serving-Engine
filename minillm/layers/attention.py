@@ -283,20 +283,42 @@ class FlashInferPlanner:
         wrapper.plan(*args, **kwargs)
         done.record()
 
+    def plan_layout(
+        self,
+        indptr: list[int],
+        indices: torch.Tensor,
+        last_page_len: list[int],
+        qo_indptr: list[int] | None = None,
+    ) -> Any:
+        """Plan a step from its page layout; ``indices`` may already be on the device.
+
+        ``qo_indptr`` (query offsets) selects the prefill kernel; without it every
+        sequence has one query token and the decode kernel runs.
+        """
+        if qo_indptr is None:
+            indptr_h, last_h = pinned_views([indptr, last_page_len], torch.int32, pin=True)
+            self.run_plan(self.decode, indptr_h, indices, last_h, *self.shape, **self.kwargs)
+            return self.decode
+        qo_h, indptr_h, last_h = pinned_views(
+            [qo_indptr, indptr, last_page_len], torch.int32, pin=True
+        )
+        self.run_plan(
+            self.prefill, qo_h, indptr_h, indices, last_h, *self.shape, causal=True, **self.kwargs
+        )
+        return self.prefill
+
     def plan(
         self, block_tables: list[list[int]], seq_lens: list[int], query_lens: list[int]
     ) -> Any:
+        """Plan from Python block tables (tests; the engine uses ``plan_layout``)."""
         indptr, indices, last = paged_kv_layout(block_tables, seq_lens, self.block_size)
-        qo_indptr = [0]
-        for q_len in query_lens:
-            qo_indptr.append(qo_indptr[-1] + q_len)
-        if max(query_lens) == 1:
-            args = pinned_views([indptr, indices, last], torch.int32, pin=True)
-            self.run_plan(self.decode, *args, *self.shape, **self.kwargs)
-            return self.decode
-        args = pinned_views([qo_indptr, indptr, indices, last], torch.int32, pin=True)
-        self.run_plan(self.prefill, *args, *self.shape, causal=True, **self.kwargs)
-        return self.prefill
+        (indices_h,) = pinned_views([indices], torch.int32, pin=True)
+        qo_indptr = None
+        if max(query_lens) > 1:
+            qo_indptr = [0]
+            for q_len in query_lens:
+                qo_indptr.append(qo_indptr[-1] + q_len)
+        return self.plan_layout(indptr, indices_h, last, qo_indptr)
 
 
 _BACKENDS = {
@@ -317,15 +339,28 @@ class PagedAttention(nn.Module):
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
         self.scale = scale
-        # Views into the engine's KV pool, assigned by the model runner.
+        # Views into the engine's KV pool, assigned by the model runner: K and V
+        # separately, and both as one [2, blocks, block_size, heads, dim] view.
         self.k_cache: torch.Tensor | None = None
         self.v_cache: torch.Tensor | None = None
+        self.kv_cache: torch.Tensor | None = None
 
     def forward(
-        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, meta: AttentionMetadata
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        meta: AttentionMetadata,
+        kv: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """``kv``, if given, is k and v as one [tokens, 2, heads, dim] view (k already
+        rotated); the cache write then takes one kernel instead of two."""
         if meta.block_tables is not None:
             if self.k_cache is None or self.v_cache is None or meta.slot_mapping is None:
                 raise RuntimeError("KV cache not allocated")
-            write_kv_cache(k, v, self.k_cache, self.v_cache, meta.slot_mapping)
+            if kv is not None and self.kv_cache is not None:
+                cache = self.kv_cache.view(2, -1, self.num_kv_heads, self.head_dim)
+                cache.index_copy_(1, meta.slot_mapping, kv.transpose(0, 1))
+            else:
+                write_kv_cache(k, v, self.k_cache, self.v_cache, meta.slot_mapping)
         return _BACKENDS[meta.backend](q, k, v, self.k_cache, self.v_cache, meta, self.scale)

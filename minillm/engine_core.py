@@ -57,15 +57,7 @@ def build_engine(config: EngineConfig) -> LLMEngine:
 
 
 def _pack(out: TokenOutput) -> tuple[Any, ...]:
-    return (
-        out.request_id,
-        out.token_id,
-        out.finished,
-        out.finish_reason,
-        out.num_prompt_tokens,
-        out.num_output_tokens,
-        out.num_cached_tokens,
-    )
+    return tuple(out)  # a plain tuple pickles smaller than the NamedTuple
 
 
 def run_engine_core(
@@ -238,7 +230,7 @@ class EngineCoreClient(EngineClient):
         kind = msg[0]
         if kind == "out":
             _, packed, stats = msg
-            self._dispatch([TokenOutput(*t) for t in packed])
+            self._dispatch([TokenOutput._make(t) for t in packed])
             if self.metrics is not None:
                 self.metrics.record(stats)
         elif kind == "reject":

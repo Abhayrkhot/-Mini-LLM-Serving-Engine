@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from minillm.layers.attention import AttentionMetadata, paged_kv_layout, pinned_views
+from minillm.layers.attention import AttentionMetadata, pinned_views
 from minillm.utils import cdiv
 
 if TYPE_CHECKING:
@@ -84,19 +84,15 @@ class DecodeGraphs:
         self._plan_kwargs = runner.flashinfer.kwargs
         self._capture()
 
-    def _plan(self, b: int, tables: list[list[int]], seq_lens: list[int]) -> None:
-        """Plan size ``b``'s wrapper for the real sequences plus scratch padding rows."""
+    def _plan(self, b: int, indptr: list[int], indices: torch.Tensor, last: list[int]) -> None:
+        """Plan size ``b``'s wrapper. ``indices`` must be on the device: from host
+        memory, a CUDA-graph wrapper copies them synchronously, which would stall
+        async scheduling."""
         planner = self.runner.flashinfer
         assert planner is not None
-        indptr, indices, last = paged_kv_layout(
-            tables, seq_lens, self.runner.block_size, b - len(tables), self.scratch_block
-        )
-        indptr_h, last_h, indices_h = pinned_views([indptr, last, indices], torch.int32, pin=True)
-        # Indices go over already on the device: from host memory, a CUDA-graph
-        # wrapper copies them synchronously, which would stall async scheduling.
-        indices_d = indices_h.to(self.static.device, non_blocking=True)
+        indptr_h, last_h = pinned_views([indptr, last], torch.int32, pin=True)
         planner.run_plan(
-            self.wrappers[b], indptr_h, indices_d, last_h, *planner.shape, **self._plan_kwargs
+            self.wrappers[b], indptr_h, indices, last_h, *planner.shape, **self._plan_kwargs
         )
 
     @torch.inference_mode()
@@ -121,7 +117,9 @@ class DecodeGraphs:
                 decode_only=True,
                 flashinfer=self.wrappers[b],
             )
-            self._plan(b, [], [])  # all rows padding: attend over the scratch block
+            # All rows padding: attend over the scratch block.
+            scratch = torch.full((b,), self.scratch_block, dtype=torch.int32, device=device)
+            self._plan(b, list(range(b + 1)), scratch, [1] * b)
             model(self.input_ids[:b], self.positions[:b], meta)  # warm-up outside the graph
             torch.cuda.synchronize()
             graph = torch.cuda.CUDAGraph()
@@ -141,21 +139,29 @@ class DecodeGraphs:
     def can_run(self, num_seqs: int) -> bool:
         return num_seqs <= self.sizes[-1]
 
+    def padded_size(self, num_seqs: int) -> int:
+        return self.sizes[bisect.bisect_left(self.sizes, num_seqs)]
+
     def run(self, batch: _Batch) -> torch.Tensor:
-        """Replay the graph for this decode batch; returns hidden states for the real rows."""
-        n = batch.num_seqs
-        b = self.sizes[bisect.bisect_left(self.sizes, n)]
+        """Replay the graph for this decode batch; returns hidden states for the real rows.
+
+        Token ids, positions and KV slots go into the static buffer in one copy;
+        the runner has laid out the pages for the padded size (padding rows point
+        at the scratch block).
+        """
+        n, dev = batch.num_seqs, batch.dev
+        b = self.padded_size(n)
         gap = len(self.input_ids) - n  # up to the next segment of the static buffer
         scratch_slot = self.scratch_block * self.runner.block_size
         host = [
             *batch.input_ids, *[0] * gap,
-            *batch.positions, *[0] * gap,
+            *batch.starts, *[0] * gap,
             *batch.slots, *[scratch_slot] * (b - n),
         ]  # fmt: skip
         staged = torch.tensor(host, dtype=torch.long, pin_memory=True)
-        self.static[: len(host)].copy_(staged, non_blocking=True)
+        self.static[: len(host)].copy_(staged, non_blocking=True)  # one copy for all three
         self.runner.gather_pending(self.input_ids, batch)
-        self._plan(b, batch.tables, batch.seq_lens)
+        self._plan(b, batch.indptr, dev["page_indices"], batch.last_page_len)
         self.graphs[b].replay()
         self.replays += 1
         return self.outputs[b][:n]

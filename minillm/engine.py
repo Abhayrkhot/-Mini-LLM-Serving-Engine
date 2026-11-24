@@ -7,6 +7,7 @@ import logging
 import time
 from collections.abc import Sequence as SequenceABC
 from dataclasses import dataclass
+from typing import NamedTuple
 
 from minillm.block_manager import BlockManager
 from minillm.config import EngineConfig
@@ -22,9 +23,12 @@ logger = logging.getLogger(__name__)
 _STATS_INTERVAL_S = 10.0
 
 
-@dataclass(frozen=True)
-class TokenOutput:
-    """One generated token, copied out of the engine so other threads can read it safely."""
+class TokenOutput(NamedTuple):
+    """One generated token, copied out of the engine so other threads can read it safely.
+
+    A NamedTuple: immutable, cheap to build for every token of every step, and it
+    crosses the process boundary as a plain tuple.
+    """
 
     request_id: str
     token_id: int

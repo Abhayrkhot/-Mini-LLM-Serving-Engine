@@ -118,6 +118,16 @@ def test_prefix_cache_hits_match_hf(name, tiny_model_dirs, hf_models):
         assert res.output_token_ids == hf_greedy(hf_models[name], prompt, 20)
 
 
+def test_block_table_rows_are_reused_correctly(tiny_model_dirs, hf_models):
+    """More requests than block-table rows: rows of finished sequences are handed
+    to new ones, and a reused row must not leak the previous owner's pages."""
+    prompts = _prompts(9, seed=7)
+    engine = _engine(tiny_model_dirs["qwen2"], max_num_seqs=2)
+    results = engine.generate(prompts, GREEDY)
+    expected = [hf_greedy(hf_models["qwen2"], p, GREEDY.max_tokens) for p in prompts]
+    assert [r.output_token_ids for r in results] == expected
+
+
 def test_stale_nan_in_cache_does_not_leak(tiny_model_dirs, hf_models):
     # Poison every cache slot: anything read without being written first would
     # turn the output into NaN (argmax 0). Correct paged attention never reads it.
