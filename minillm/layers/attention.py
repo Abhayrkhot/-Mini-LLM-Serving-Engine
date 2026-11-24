@@ -307,6 +307,34 @@ class FlashInferPlanner:
         )
         return self.prefill
 
+    def plan_split(
+        self,
+        indptr: list[int],
+        indices: torch.Tensor,
+        last_page_len: list[int],
+        qo_indptr: list[int],
+        num_decode: int,
+    ) -> Any:
+        """Plan a step whose first ``num_decode`` sequences have one query token each
+        and the rest prompt chunks: the decode kernel for the former, the prefill
+        kernel for the latter.
+
+        FlashInfer's prefill kernel tiles over query rows, so a decode row (one
+        query token, a long context) wastes most of a tile: in a step mixing 192
+        decodes with a 512-token chunk on Qwen2.5-7B, attention alone took 13 ms
+        that way, more than the chunk's whole step on its own.
+        """
+        d = num_decode
+        split = indptr[d]
+        decode = self.plan_layout(indptr[: d + 1], indices[:split], last_page_len[:d])
+        prefill = self.plan_layout(
+            [p - split for p in indptr[d:]],
+            indices[split:],
+            last_page_len[d:],
+            [q - d for q in qo_indptr[d:]],  # the decode rows hold one token each
+        )
+        return SplitAttention(decode, prefill, d)
+
     def plan(
         self, block_tables: list[list[int]], seq_lens: list[int], query_lens: list[int]
     ) -> Any:
@@ -319,6 +347,22 @@ class FlashInferPlanner:
             for q_len in query_lens:
                 qo_indptr.append(qo_indptr[-1] + q_len)
         return self.plan_layout(indptr, indices_h, last, qo_indptr)
+
+
+class SplitAttention:
+    """A planned mixed step: decode rows (first) and prompt chunks in separate kernels."""
+
+    def __init__(self, decode: Any, prefill: Any, num_decode: int) -> None:
+        self.decode = decode
+        self.prefill = prefill
+        self.num_decode = num_decode
+
+    def run(self, q: torch.Tensor, kv_cache: Any) -> torch.Tensor:
+        d = self.num_decode
+        out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
+        self.decode.run(q[:d], kv_cache, out=out[:d])
+        self.prefill.run(q[d:], kv_cache, out=out[d:])
+        return out
 
 
 _BACKENDS = {

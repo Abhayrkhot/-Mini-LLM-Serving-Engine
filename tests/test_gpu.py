@@ -73,6 +73,44 @@ def test_kernel_matches_torch_reference(backend: str, head_dim: int, seed: int) 
     torch.testing.assert_close(out.float(), b.reference, atol=3e-2, rtol=3e-2)
 
 
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("seed", range(4))
+@pytest.mark.skipif(not _importable("flashinfer"), reason="flashinfer not usable")
+def test_split_mixed_attention_matches_torch_reference(head_dim: int, seed: int) -> None:
+    """A mixed step planned split (decodes through the decode kernel, chunks through
+    the prefill kernel) computes the same attention as the reference."""
+    b = random_paged_batch(
+        seed,
+        num_heads=14,
+        num_kv_heads=2,
+        head_dim=head_dim,
+        block_size=16,
+        max_len=700,
+        device="cuda",
+        dtype=torch.bfloat16,
+        backend="flashinfer",
+        decodes_first=True,
+    )
+    assert b.meta.slot_mapping is not None
+    write_kv_cache(b.k, b.v, b.k_cache, b.v_cache, b.meta.slot_mapping)
+    planner = FlashInferPlanner(
+        torch.device("cuda"), 14, 2, head_dim, 16, torch.bfloat16, workspace_mb=64
+    )
+    from minillm.layers.attention import paged_kv_layout, pinned_views
+
+    indptr, indices, last = paged_kv_layout(b.tables, b.k_lens, 16)
+    qo = [0]
+    for q_len in b.q_lens:
+        qo.append(qo[-1] + q_len)
+    (indices_h,) = pinned_views([indices], torch.int32, pin=True)
+    num_decode = len(b.q_lens) - 2  # decodes first, then a chunk and a full prompt
+    b.meta.flashinfer = planner.plan_split(indptr, indices_h.cuda(), last, qo, num_decode)
+    out = flashinfer_attention(b.q, b.k, b.v, b.k_cache, b.v_cache, b.meta, b.scale)
+    ref = torch_attention(b.q, b.k, b.v, b.k_cache, b.v_cache, b.meta, b.scale)
+    torch.testing.assert_close(out.float(), ref.float(), atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(out.float(), b.reference, atol=3e-2, rtol=3e-2)
+
+
 @pytest.fixture(scope="module")
 def tiny_qwen2_hd64(tmp_path_factory: pytest.TempPathFactory) -> str:
     """A random Qwen2 with head_dim 64, a size FlashInfer ships prebuilt kernels for."""
@@ -136,7 +174,9 @@ def test_engine_is_as_accurate_as_reference_backend(
     """
     from tests.conftest import load_hf_model
 
-    prompts = [[(7 * i + j) % 500 + 3 for j in range(10 + 37 * i)] for i in range(8)]
+    # 16 prompts x 48 tokens: on this random model ~7% of tokens are near-ties that bf16
+    # can flip either way, so fewer tokens leave the comparison mostly noise.
+    prompts = [[(7 * i + j) % 500 + 3 for j in range(10 + 19 * i)] for i in range(16)]
     hf = load_hf_model(tiny_qwen2_hd64, torch.float32).to("cuda")
     scores = {}
     for name in (backend, "torch"):
@@ -156,7 +196,7 @@ def test_engine_is_as_accurate_as_reference_backend(
             )
         )
         scores[name] = _teacher_forced_agreement(engine, hf, prompts)
-        if block_size < 256:  # 1,024 cache slots for ~2,300 tokens
+        if block_size < 256:  # 1,024 cache slots for ~3,200 tokens
             assert engine.scheduler.num_preemptions > 0
         graphs = getattr(engine.executor, "graphs", None)
         if name == backend and not eager:
