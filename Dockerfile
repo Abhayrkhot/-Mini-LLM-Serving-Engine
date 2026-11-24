@@ -50,16 +50,20 @@ RUN useradd --create-home --uid 1000 --shell /usr/sbin/nologin minillm \
 # Dependencies first, so this layer (almost all of the image) is rebuilt only
 # when pyproject.toml or the versions above change. uv is mounted, not installed.
 # Bytecode is compiled up front: the server runs as a user that cannot write
-# __pycache__ into the virtualenv.
+# __pycache__ into the virtualenv. flashinfer-jit-cache comes straight from
+# FlashInfer's GitHub release (where its index, flashinfer.ai/whl, points) and
+# everything else from PyPI: as an extra index, flashinfer.ai was asked about
+# every package, so an outage there failed the whole build.
 RUN --mount=from=uv,source=/uv,target=/usr/local/bin/uv \
     --mount=type=bind,source=pyproject.toml,target=/tmp/pyproject.toml \
     export UV_NO_CACHE=1 UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy UV_PYTHON_DOWNLOADS=never \
  && uv venv /opt/venv \
  && uv pip install --index-url "https://download.pytorch.org/whl/${CUDA_TAG}" \
       "torch==${TORCH_VERSION}+${CUDA_TAG}" \
- && uv pip install --extra-index-url "https://flashinfer.ai/whl/${CUDA_TAG}" \
+ && release="https://github.com/flashinfer-ai/flashinfer/releases/download/v${FLASHINFER_VERSION}" \
+ && uv pip install \
       "flashinfer-python==${FLASHINFER_VERSION}" \
-      "flashinfer-jit-cache==${FLASHINFER_VERSION}+${CUDA_TAG}" \
+      "flashinfer-jit-cache @ ${release}/flashinfer_jit_cache-${FLASHINFER_VERSION}+${CUDA_TAG}-cp39-abi3-manylinux_2_28_$(uname -m).whl" \
       -r /tmp/pyproject.toml
 
 RUN --mount=from=uv,source=/uv,target=/usr/local/bin/uv \
