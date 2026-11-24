@@ -1,0 +1,16 @@
+{
+  "engine": "vllm",
+  "model": "Qwen/Qwen2.5-0.5B-Instruct",
+  "num_prompts": 500,
+  "input_len": 512,
+  "output_len": 128,
+  "range_ratio": 0.0,
+  "elapsed_s": 1.566308343783021,
+  "output_tokens": 64000,
+  "output_throughput": 40860.40928915964,
+  "total_token_throughput": 204302.0464457982,
+  "request_throughput": 319.22194757155967,
+  "gpu": "NVIDIA H200",
+  "torch": "2.14.0+cu130",
+  "enforce_eager": false
+}

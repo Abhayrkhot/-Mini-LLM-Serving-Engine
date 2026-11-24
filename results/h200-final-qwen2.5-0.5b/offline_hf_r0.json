@@ -1,0 +1,28 @@
+{
+  "engine": "hf",
+  "model": "Qwen/Qwen2.5-0.5B-Instruct",
+  "num_prompts": 500,
+  "input_len": 512,
+  "output_len": 128,
+  "range_ratio": 0.0,
+  "elapsed_s": 10.876418586820364,
+  "output_tokens": 64000,
+  "output_throughput": 5884.289896451099,
+  "total_token_throughput": 29421.44948225549,
+  "request_throughput": 45.97101481602421,
+  "gpu": "NVIDIA H200",
+  "torch": "2.14.0+cu130",
+  "batch_size": 64,
+  "dtype": "torch.bfloat16",
+  "batch_seconds": [
+    1.371,
+    1.364,
+    1.359,
+    1.359,
+    1.358,
+    1.358,
+    1.359,
+    1.348
+  ],
+  "cudnn_attention": false
+}

@@ -1,0 +1,6 @@
+{
+  "source": "engine load log (offline_*_r0.log): 'Loaded ... GiB of weights'",
+  "weights_gib": {"minillm": 14.19, "minillm-w4a16": 5.19},
+  "kv_bytes_per_token": 57344,
+  "kv_bytes_per_token_note": "28 layers x (K, V) x 4 KV heads x 128 dims x 2 bytes (bf16)"
+}
