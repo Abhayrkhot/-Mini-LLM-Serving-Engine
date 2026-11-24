@@ -177,7 +177,7 @@ docker run --gpus all -p 8000:8000 -v hf-cache:/data minillm \
 
 **Checked on a GPU** (RTX 3050 Ti Laptop, 4 GB, driver 580) serving Qwen2.5-0.5B-Instruct with `--max-model-len 2048 --max-num-seqs 16 --gpu-memory-utilization 0.85`. The log shows `attention=flashinfer, fused kernels` and decode CUDA graphs captured. `/health` answered about 30 s after start with the 1 GB weight download, and 9 s with the weights cached. Completions, streaming chat and 32 concurrent requests returned sensible text, the container turned healthy, and `docker stop` shut it down cleanly. The image has not been run on an H200 yet; it includes FlashInfer's sm90 kernels for head dims 64 and 128.
 
-**In CI** the `container` job builds the image and checks it on CPU, since GitHub's runners have no GPU:
+**In CI** the `container` workflow builds the image and checks it on CPU, since GitHub's runners have no GPU. It runs on every push to master and on pull requests that change the Dockerfile or `pyproject.toml`:
 
 - torch and FlashInfer import, with torch built for CUDA 12.8
 - `minillm-serve --help` runs
