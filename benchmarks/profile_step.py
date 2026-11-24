@@ -35,7 +35,7 @@ class PhaseTimer:
     """Wraps the engine's scheduler and executor to time each phase."""
 
     def __init__(self, engine: LLMEngine) -> None:
-        self.times: dict[str, float] = {"launch": 0.0, "wait": 0.0, "apply": 0.0}
+        self.times: dict[str, float] = {"launch": 0.0, "wait": 0.0, "apply": 0.0, "replay": 0.0}
         sched, executor = engine.scheduler, engine.executor
         schedule, update, execute_async = sched.schedule, sched.update, executor.execute_async
 
@@ -58,6 +58,9 @@ class PhaseTimer:
         executor.execute_async = timed(  # type: ignore[method-assign]
             "launch", lambda scheduled: Handle(execute_async(scheduled))
         )
+        graphs = getattr(executor, "graphs", None)  # CUDA-graph replays, part of "launch"
+        for graph in graphs.graphs.values() if graphs is not None else ():
+            graph.replay = timed("replay", graph.replay)
 
     def reset(self) -> None:
         self.times = dict.fromkeys(self.times, 0.0)
@@ -155,6 +158,85 @@ def profile(
     return row
 
 
+def mixed_steps(
+    engine: LLMEngine, batch: int, prompt: int, args: argparse.Namespace
+) -> dict[str, Any]:
+    """GPU time of a step that mixes ``batch`` decodes with one ``prompt``-token
+    chunk, next to a decode-only step of the same batch and the chunk alone, plus
+    a kernel breakdown of the mixed step."""
+    from torch.autograd import DeviceType
+    from torch.profiler import ProfilerActivity
+    from torch.profiler import profile as torch_profile
+
+    ids = add_requests(engine, batch, args)
+    engine.async_scheduling = False
+    for _ in range(args.warmup):
+        engine.step()
+    decode_ms = gpu_step_ms(engine, 20, args.cycles_per_ms)
+    rng = random.Random(prompt)
+    vocab = engine.executor.vocab_size
+
+    def chunk_ms(runs: int, alone: bool) -> list[float]:
+        times = []
+        for _ in range(runs):
+            rid = engine.add_request(
+                [rng.randrange(vocab) for _ in range(prompt)],
+                SamplingParams(max_tokens=1, temperature=0.0, ignore_eos=True),
+            )
+            if alone:  # the chunk without the decodes: hold them back for one step
+                held = engine.scheduler.running
+                engine.scheduler.running = []
+            times.append(gpu_step_ms(engine, 1, args.cycles_per_ms))
+            if alone:
+                engine.scheduler.running = held + engine.scheduler.running
+            engine.abort_request(rid)
+        return times
+
+    alone = statistics.median(chunk_ms(10, alone=True))
+    mixed = statistics.median(chunk_ms(10, alone=False))
+    with torch_profile(activities=[ProfilerActivity.CUDA]) as prof:
+        chunk_ms(5, alone=False)
+    kernels: dict[str, float] = {}
+    for ev in prof.key_averages():
+        if ev.device_type != DeviceType.CUDA or "sleep" in ev.key or "spin" in ev.key:
+            continue
+        total = getattr(ev, "self_device_time_total", None) or ev.self_cuda_time_total
+        kernels[ev.key] = total / 5 / 1e3
+    finish(engine, ids)
+    top = sorted(kernels.items(), key=lambda kv: -kv[1])[:8]
+    return {
+        "batch": batch,
+        "prompt": prompt,
+        "decode_ms": decode_ms,
+        "chunk_alone_ms": alone,
+        "mixed_ms": mixed,
+        "top_kernels_ms": top,
+    }
+
+
+def cprofile_steps(engine: LLMEngine, batch: int, args: argparse.Namespace) -> str:
+    """Python profile of ``args.steps`` async decode steps at ``batch``, top functions."""
+    import cProfile
+    import io
+    import pstats
+
+    ids = add_requests(engine, batch, args)
+    engine.async_scheduling = True
+    for _ in range(args.warmup):
+        engine.step()
+    prof = cProfile.Profile()
+    prof.enable()
+    for _ in range(args.steps):
+        engine.step()
+    prof.disable()
+    engine.async_scheduling = False
+    engine.step()
+    finish(engine, ids)
+    out = io.StringIO()
+    pstats.Stats(prof, stream=out).sort_stats("tottime").print_stats(35)
+    return out.getvalue()
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     p.add_argument("--model", required=True)
@@ -165,13 +247,22 @@ def main() -> None:
     p.add_argument("--enforce-eager", action="store_true")
     p.add_argument("--no-fused-kernels", dest="fused_kernels", action="store_false")
     p.add_argument("--kernels", type=int, default=None, metavar="B", help="kernel breakdown at B")
+    p.add_argument("--cprofile", type=int, default=None, metavar="B", help="Python profile at B")
+    p.add_argument(
+        "--mixed",
+        default=None,
+        metavar="B,P",
+        help="GPU time of B decodes plus one P-token prompt chunk in one step",
+    )
     p.add_argument("--output", default=None)
     args = p.parse_args()
 
     engine = LLMEngine(
         EngineConfig(
             model=args.model,
-            max_num_seqs=max(args.batch_sizes),
+            max_num_seqs=max(
+                [*args.batch_sizes, int(args.mixed.split(",")[0]) + 1 if args.mixed else 1]
+            ),
             max_num_batched_tokens=max(8192, args.prompt_len * max(args.batch_sizes) // 8),
             enforce_eager=args.enforce_eager,
             fused_kernels=args.fused_kernels,
@@ -203,6 +294,19 @@ def main() -> None:
         for k in kernels[:20]:
             print(f"| `{k['kernel'][:70]}` | {k['us']:.0f} | {k['launches']:.0f} |")
         result["kernels"] = {"batch": args.kernels, "rows": kernels}
+    if args.mixed:
+        b, prompt = (int(x) for x in args.mixed.split(","))
+        m = mixed_steps(engine, b, prompt, args)
+        print(
+            f"\nMixed step: {b} decodes + a {prompt}-token chunk: {m['mixed_ms']:.2f} ms GPU; "
+            f"decodes alone {m['decode_ms']:.2f} ms, chunk alone {m['chunk_alone_ms']:.2f} ms"
+        )
+        for name, ms in m["top_kernels_ms"]:
+            print(f"  {ms:7.3f} ms  {name[:90]}")
+        result["mixed"] = m
+    if args.cprofile:
+        print(f"\nPython profile, {args.steps} async decode steps at batch {args.cprofile}:")
+        print(cprofile_steps(engine, args.cprofile, args))
     if args.output:
         with open(args.output, "w") as f:
             json.dump(result, f, indent=2)

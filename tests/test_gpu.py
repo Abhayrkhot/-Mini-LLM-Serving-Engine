@@ -301,3 +301,34 @@ def test_fused_ops_match_pytorch_reference(head_dim: int) -> None:
     gate_up = torch.randn(tokens, 2 * inter, device=dev, dtype=bf16)
     gate, up = gate_up.chunk(2, dim=-1)
     close(ops.silu_and_mul(gate_up), torch.nn.functional.silu(gate) * up)
+
+
+@pytest.mark.parametrize("eager", [False, True], ids=["cudagraphs", "eager"])
+@pytest.mark.skipif(not _importable("flashinfer"), reason="flashinfer not usable")
+def test_device_built_page_lists_match_host_built(
+    eager: bool, tiny_qwen2_hd64: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FlashInfer's page list is built in Python for small batches and on the GPU
+    from the block tables for large ones; both must give identical outputs."""
+    from minillm.executor.model_runner import ModelRunner
+
+    prompts = [[(13 * i + j) % 500 + 3 for j in range(7 + 31 * i)] for i in range(8)]
+    params = SamplingParams(max_tokens=40, temperature=0.0, ignore_eos=True)
+    outputs = {}
+    for limit in (ModelRunner.HOST_PAGES_MAX, 0):
+        monkeypatch.setattr(ModelRunner, "HOST_PAGES_MAX", limit)
+        engine = LLMEngine(
+            EngineConfig(
+                model=tiny_qwen2_hd64,
+                device="cuda",
+                dtype="bfloat16",
+                attention_backend="flashinfer",
+                max_model_len=512,
+                num_kv_blocks=40,  # 640 slots for ~1,240 tokens: preemption rebuilds rows
+                max_num_batched_tokens=64,
+                enforce_eager=eager,
+            )
+        )
+        outputs[limit] = [r.output_token_ids for r in engine.generate(prompts, params)]
+        assert engine.scheduler.num_preemptions > 0
+    assert outputs[0] == outputs[ModelRunner.HOST_PAGES_MAX]

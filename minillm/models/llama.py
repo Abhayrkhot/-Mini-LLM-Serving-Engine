@@ -209,18 +209,24 @@ class Attention(nn.Module):
         meta: AttentionMetadata,
         ops: FusedOps,
     ) -> torch.Tensor:
-        q, k, v = self.qkv_proj(x).split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        qkv = self.qkv_proj(x)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        kv = None
         if self.q_norm is not None and self.k_norm is not None:
             # Per-head norms over contiguous [tokens * heads, head_dim] rows.
             q = ops.rmsnorm(q.reshape(-1, self.head_dim), self.q_norm.weight, self.q_norm.eps)
             k = ops.rmsnorm(k.reshape(-1, self.head_dim), self.k_norm.weight, self.k_norm.eps)
             q, k = q.view(-1, self.q_size), k.view(-1, self.kv_size)
+        else:
+            # k and v sit side by side in the qkv buffer: one cache write covers both.
+            kv = qkv[:, self.q_size :].view(-1, 2, self.num_kv_heads, self.head_dim)
         ops.rope(positions, q, k, self.head_dim, cos_sin_cache)  # in place, on the qkv buffer
         out = self.attn(
             q.view(-1, self.num_heads, self.head_dim),
             k.view(-1, self.num_kv_heads, self.head_dim),
             v.view(-1, self.num_kv_heads, self.head_dim),
             meta,
+            kv=kv,
         )
         return self.o_proj(out.reshape(-1, self.q_size))
 
