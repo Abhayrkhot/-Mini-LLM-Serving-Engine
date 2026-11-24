@@ -366,6 +366,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--num-kv-blocks", type=int, default=None)
     p.add_argument("--enforce-eager", action="store_true", help="disable decode CUDA graphs")
     p.add_argument(
+        "--no-fused-kernels",
+        dest="fused_kernels",
+        action="store_false",
+        help="run norms, rotary embeddings and SiLU as PyTorch ops, not FlashInfer's fused kernels",
+    )
+    p.add_argument(
         "--no-async-scheduling",
         dest="async_scheduling",
         action="store_false",
@@ -405,6 +411,7 @@ def main(argv: list[str] | None = None) -> None:
         kv_cache_memory_gb=args.kv_cache_memory_gb,
         num_kv_blocks=args.num_kv_blocks,
         enforce_eager=args.enforce_eager,
+        fused_kernels=args.fused_kernels,
         async_scheduling=args.async_scheduling,
         seed=args.seed,
     )
