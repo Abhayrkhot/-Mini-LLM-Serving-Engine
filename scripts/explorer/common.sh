@@ -4,6 +4,8 @@
 #   MINILLM_ROOT  work dir on scratch (overlay, results, caches)   default /scratch/$USER/minillm
 #   MINILLM_SIF   vLLM image (vLLM 0.34, torch 2.14+cu130, FlashInfer 0.7.3)
 #   HF_HOME       Hugging Face cache holding the models (used offline)
+#   EXTRA_PYTHONPATH  more package dirs for the container, e.g. $MINILLM_ROOT/overlay-fa
+#                 (flash-attn, from build_flash_attn.sh)
 
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 export ROOT=${MINILLM_ROOT:-/scratch/$USER/minillm}
@@ -21,8 +23,8 @@ mkdir -p "$TRITON_CACHE_DIR" "$ROOT/results"
 INNER='export LD_LIBRARY_PATH=/usr/local/cuda/compat${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}; exec "$@"'
 
 img() {  # img <command...>: run inside the image with the GPU, scratch and our overlay
-  PYTHONPATH="$REPO:$ROOT/overlay" apptainer exec --nv --bind "/scratch/$USER" "$SIF" \
-    bash -c "$INNER" _ "$@"
+  PYTHONPATH="$REPO:$ROOT/overlay${EXTRA_PYTHONPATH:+:$EXTRA_PYTHONPATH}" \
+    apptainer exec --nv --bind "/scratch/$USER" "$SIF" bash -c "$INNER" _ "$@"
 }
 
 SERVER_PID=""

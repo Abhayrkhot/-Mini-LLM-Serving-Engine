@@ -1,0 +1,13 @@
+{
+  "model": "Qwen/Qwen2.5-7B-Instruct",
+  "text": "wikitext-2-raw-v1 test",
+  "tokens": 299078,
+  "window": 2048,
+  "group_size": 128,
+  "projections_quantized": 196,
+  "bf16_perplexity": 7.460786505586107,
+  "w4a16_perplexity": 7.886253330441216,
+  "perplexity_increase": 0.0570270740942056,
+  "top1_agreement": 0.8756468892097473,
+  "seconds": 21.65424680709839
+}

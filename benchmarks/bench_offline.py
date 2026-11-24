@@ -31,15 +31,27 @@ def _length(rng: random.Random, mean: int, ratio: float) -> int:
     return max(1, rng.randint(int(mean * (1 - ratio)), int(mean * (1 + ratio))))
 
 
-def make_requests(args: argparse.Namespace, vocab_size: int) -> list[tuple[list[int], int]]:
+# Token ids are drawn from one fixed range that every supported vocabulary covers, so
+# every engine gets byte-identical prompts. (Drawing below each engine's own vocabulary
+# size made the random stream, and with it the prompt lengths, differ between engines.)
+TOKEN_IDS = (100, 31_900)
+
+
+def make_requests(args: argparse.Namespace) -> list[tuple[list[int], int]]:
     """(prompt token ids, output length) pairs, identical for every engine."""
     rng = random.Random(args.seed)
+    lo, hi = TOKEN_IDS
     requests = []
     for _ in range(args.num_prompts):
         n_in = _length(rng, args.input_len, args.range_ratio)
         n_out = _length(rng, args.output_len, args.range_ratio)
-        requests.append(([rng.randrange(100, vocab_size - 100) for _ in range(n_in)], n_out))
+        requests.append(([rng.randrange(lo, hi) for _ in range(n_in)], n_out))
     return requests
+
+
+def _check_vocab(vocab_size: int) -> None:
+    if vocab_size < TOKEN_IDS[1]:
+        raise SystemExit(f"vocabulary of {vocab_size} is smaller than the prompt token ids")
 
 
 WARMUP_REQUESTS = (
@@ -73,7 +85,8 @@ def run_minillm(args: argparse.Namespace) -> tuple[float, int, dict[str, Any]]:
             async_scheduling=args.async_scheduling,
         )
     )
-    requests = make_requests(args, engine.executor.vocab_size)
+    _check_vocab(engine.executor.vocab_size)
+    requests = make_requests(args)
     prompts = [p for p, _ in requests]
     params = [SamplingParams(max_tokens=n, temperature=0.0, ignore_eos=True) for _, n in requests]
     warm = SamplingParams(max_tokens=WARMUP_TOKENS, temperature=0.0, ignore_eos=True)
@@ -106,12 +119,19 @@ def run_hf(args: argparse.Namespace) -> tuple[float, int, dict[str, Any]]:
 
     device = resolve_device(args.device)
     dtype = resolve_dtype(args.dtype, device)
+    if device.type == "cuda":
+        # cuDNN attention, one of the kernels PyTorch's SDPA picks from, builds a plan the
+        # first time it sees a shape: about 4.6 s for a 64 x 512-token batch of Qwen2.5-0.5B
+        # on an H200, against 1.4 s to generate it. Static batching meets a new shape with
+        # every batch width, so leave cuDNN out; the other SDPA kernels are as fast once warm.
+        torch.backends.cuda.enable_cudnn_sdp(False)
     import transformers
 
     # transformers 5 renamed torch_dtype to dtype; older releases ignore the new name.
     key = "dtype" if int(transformers.__version__.split(".")[0]) >= 5 else "torch_dtype"
     model = AutoModelForCausalLM.from_pretrained(args.model, **{key: dtype}).to(device).eval()
-    requests = make_requests(args, model.config.vocab_size)
+    _check_vocab(model.config.vocab_size)
+    requests = make_requests(args)
     bs = args.hf_batch_size
 
     def generate(batch: list[tuple[list[int], int]]) -> int:
@@ -135,9 +155,16 @@ def run_hf(args: argparse.Namespace) -> tuple[float, int, dict[str, Any]]:
     generate([(p, WARMUP_TOKENS) for p, _ in requests[: min(bs, WARMUP_REQUESTS)]])
     _sync()
     start = time.perf_counter()
-    out = sum(generate(requests[i : i + bs]) for i in range(0, len(requests), bs))
-    _sync()
-    return time.perf_counter() - start, out, {"batch_size": bs, "dtype": str(dtype)}
+    out, batch_s = 0, []
+    for i in range(0, len(requests), bs):
+        t = time.perf_counter()
+        out += generate(requests[i : i + bs])
+        _sync()
+        batch_s.append(round(time.perf_counter() - t, 3))
+    meta = {"batch_size": bs, "dtype": str(dtype), "batch_seconds": batch_s}
+    if device.type == "cuda":
+        meta["cudnn_attention"] = torch.backends.cuda.cudnn_sdp_enabled()
+    return time.perf_counter() - start, out, meta
 
 
 def run_vllm(args: argparse.Namespace) -> tuple[float, int, dict[str, Any]]:
@@ -152,7 +179,8 @@ def run_vllm(args: argparse.Namespace) -> tuple[float, int, dict[str, Any]]:
         max_model_len=_max_len(args),
         enforce_eager=args.vllm_enforce_eager,
     )
-    requests = make_requests(args, llm.get_tokenizer().vocab_size)
+    _check_vocab(llm.get_tokenizer().vocab_size)
+    requests = make_requests(args)
     prompts = [{"prompt_token_ids": p} for p, _ in requests]
     params = [VSamplingParams(max_tokens=n, temperature=0.0, ignore_eos=True) for _, n in requests]
     warm = VSamplingParams(max_tokens=WARMUP_TOKENS, temperature=0.0, ignore_eos=True)
@@ -220,8 +248,7 @@ def main() -> None:
 
     runner = {"minillm": run_minillm, "hf": run_hf, "vllm": run_vllm}[args.engine]
     elapsed, out_tokens, extra = runner(args)
-    rng_vocab = 32_000  # lengths do not depend on the vocabulary
-    in_tokens = sum(len(p) for p, _ in make_requests(args, rng_vocab))
+    in_tokens = sum(len(p) for p, _ in make_requests(args))
     result = {
         "engine": args.label or args.engine,
         "model": args.model,

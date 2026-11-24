@@ -50,8 +50,8 @@ def prompts(tokenizer: Any, args: argparse.Namespace) -> list[list[int]]:
                 + passage,
             }
         ]
-        ids = tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=True)
-        out.append(list(ids["input_ids"] if isinstance(ids, dict) else ids))
+        text = tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+        out.append(tokenizer.encode(text, add_special_tokens=False))
     return out
 
 
@@ -68,6 +68,8 @@ def run_minillm(args: argparse.Namespace, ps: list[list[int]]) -> list[dict[str,
                 max_num_seqs=max(args.concurrency),
                 max_num_batched_tokens=8192,
                 speculative_tokens=draft,
+                **({"dtype": args.dtype} if args.dtype else {}),
+                **({"attention_backend": args.attention_backend} if args.attention_backend else {}),
             )
         )
         engine.generate(ps[:4], params)  # warm-up
@@ -164,6 +166,8 @@ def main() -> None:
     p.add_argument("--concurrency", type=int, nargs="+", default=[1, 8, 32])
     p.add_argument("--num-prompts", type=int, default=64)
     p.add_argument("--passage-tokens", type=int, default=256)
+    p.add_argument("--dtype", default=None, help="minillm only, e.g. float32")
+    p.add_argument("--attention-backend", default=None, help="minillm only, e.g. torch")
     p.add_argument("--output", default=None)
     args = p.parse_args()
     from transformers import AutoTokenizer
@@ -172,6 +176,7 @@ def main() -> None:
     ps = prompts(tokenizer, args)
     rows = run_minillm(args, ps) if args.engine == "minillm" else run_vllm(args, ps)
     if args.output:
+        os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
         with open(args.output, "w") as f:
             json.dump({"model": args.model, "args": vars(args), "rows": rows}, f, indent=2)
 

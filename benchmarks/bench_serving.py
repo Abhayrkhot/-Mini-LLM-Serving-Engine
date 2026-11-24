@@ -110,6 +110,27 @@ def pct(values: list[float], q: float) -> float:
     return values[lo] + (values[hi] - values[lo]) * (k - lo)
 
 
+def worker_concurrency(max_concurrency: int | None, workers: int, worker_prompts: int) -> int:
+    """In-flight limit for one worker process. ``max_concurrency`` is a total over all
+    workers; without one, every request a worker has may be in flight at once."""
+    if max_concurrency:
+        return max(1, math.ceil(max_concurrency / max(workers, 1)))
+    return max(1, worker_prompts)
+
+
+def peak_concurrency(records: list[RequestRecord]) -> int:
+    """Most requests in flight at once, from the send and finish times."""
+    events = sorted(
+        [(r.sent_at, 1) for r in records if r.sent_at]
+        + [(r.done_at, -1) for r in records if r.sent_at and r.done_at]
+    )
+    peak = cur = 0
+    for _, delta in events:
+        cur += delta
+        peak = max(peak, cur)
+    return peak
+
+
 def summarize(
     records: list[RequestRecord], duration: float, args: argparse.Namespace
 ) -> dict[str, Any]:
@@ -140,6 +161,7 @@ def summarize(
         "model": args.model,
         "request_rate": args.request_rate,
         "max_concurrency": args.max_concurrency,
+        "peak_concurrency": peak_concurrency(records),
         "num_prompts": args.num_prompts,
         "input_len": args.input_len,
         "output_len": args.output_len,
@@ -178,8 +200,7 @@ async def _drive(
 ) -> list[RequestRecord]:
     """Send ``prompts`` with Poisson arrivals at ``rate`` from ``start_at`` (wall clock)."""
     rng = random.Random(seed)
-    per_worker = math.ceil((args.max_concurrency or len(prompts) or 1) / max(args.workers, 1))
-    sem = asyncio.Semaphore(per_worker)
+    sem = asyncio.Semaphore(worker_concurrency(args.max_concurrency, args.workers, len(prompts)))
     async with _client() as client:
 
         async def limited(p: list[int]) -> RequestRecord:
