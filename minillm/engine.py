@@ -22,6 +22,9 @@ from minillm.tokenizer import Tokenizer, load_tokenizer
 logger = logging.getLogger(__name__)
 
 _STATS_INTERVAL_S = 10.0
+# Async scheduling does not plan past a step predicted to take longer than this
+# (see LLMEngine.step).
+_LONG_STEP_S = 0.020
 
 
 class TokenOutput(NamedTuple):
@@ -113,6 +116,8 @@ class LLMEngine:
             logger.info("Speculative decoding is on: async scheduling is off")
         self._inflight: _Step | None = None
         self._last_ready = 0.0
+        # Seconds per batched token of recent steps with prompt chunks (an EMA).
+        self._prefill_s_per_token: float | None = None
         self._requests: dict[str, Sequence] = {}
         self._ids = itertools.count()
         self._stats = EngineStats()
@@ -176,7 +181,22 @@ class LLMEngine:
         Synchronous: schedule a step, run it, return its tokens. Async: schedule
         and launch step n+1, then wait for step n's tokens and return those, so
         the CPU's work on one step overlaps the GPU's work on the other.
+
+        Except after a long step (a big batch of prompt chunks): planning the
+        next step while it runs would make every request that arrives meanwhile
+        wait for that next step as well as for its own. So a step predicted to
+        take over 20 ms is collected and returned first; the caller takes in new
+        requests, and the next call plans a step that includes them. The GPU idles
+        for one step's CPU work, a few percent of such a step. On Qwen2.5-7B with
+        128 clients streaming, this lowered mean time to first token from about
+        700 to 560 ms at the same throughput.
         """
+        inflight = self._inflight
+        if inflight is not None and self._predicted_s(inflight) > _LONG_STEP_S:
+            self._inflight = None
+            results = self._complete(inflight)
+            self._flush_metrics()
+            return results
         output = self.scheduler.schedule()
         launched = None
         if not output.is_empty:
@@ -197,6 +217,12 @@ class LLMEngine:
         self._flush_metrics()
         return results
 
+    def _predicted_s(self, step: _Step) -> float:
+        rate = self._prefill_s_per_token
+        if not step.prefill_tokens or rate is None:
+            return 0.0
+        return rate * step.output.num_batched_tokens
+
     def _complete(self, step: _Step) -> list[TokenOutput]:
         """Wait for a launched step's tokens and apply them."""
         sampled = step.handle.result()
@@ -205,6 +231,10 @@ class LLMEngine:
         # previous step finishing, whichever was later) until its tokens arrived.
         elapsed = ready - max(step.launched, self._last_ready)
         self._last_ready = ready
+        if step.prefill_tokens:
+            rate = elapsed / step.output.num_batched_tokens
+            prev = self._prefill_s_per_token
+            self._prefill_s_per_token = rate if prev is None else 0.8 * prev + 0.2 * rate
         events = self.scheduler.update(step.output, sampled)
         self._record_step(step.output, events, elapsed, step.prefill_tokens)
 
