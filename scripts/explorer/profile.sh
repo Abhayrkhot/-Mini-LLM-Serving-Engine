@@ -10,3 +10,4 @@ NAME=${PROFILE_NAME:-profile}
 img python3 benchmarks/profile_step.py --model "$MODEL" --output "$OUT/$NAME.json" ${PROFILE_ARGS:-} \
   > "$OUT/$NAME.log" 2>&1
 grep -E "^\||ms per decode step|GPU kernels|Error|error" "$OUT/$NAME.log"
+grep -A45 "Python profile" "$OUT/$NAME.log"
