@@ -61,3 +61,58 @@ jobs:
             --range-ratio 0.5 --workers 2 --output load.json
           python -c "import json,sys; r=json.load(open('load.json')); sys.exit(r['failed'] != 0)"
           curl -sf localhost:8001/metrics | grep minillm_time_to_first_token_seconds_count
+
+  container:
+    # Builds the CUDA serving image and smoke-tests it on CPU: GitHub's runners
+    # have no GPU. Nothing is pushed to a registry.
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash  # -eo pipefail, so a failed curl fails the step even when piped
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space
+        # The image is about 10 GB unpacked, and the runner starts with as little as 14 GB free.
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL
+          df -h /
+      - name: Build
+        run: docker build -t minillm:ci .
+      - name: Image size
+        run: docker image ls minillm:ci
+      - name: Imports and CLI
+        run: |
+          docker run --rm --entrypoint python minillm:ci -c "
+          import importlib.metadata as md, flashinfer, torch, minillm
+          print('torch', torch.__version__, 'cuda', torch.version.cuda)
+          print('flashinfer', flashinfer.__version__, 'jit-cache', md.version('flashinfer-jit-cache'))
+          assert torch.version.cuda == '12.8', torch.version.cuda
+          "
+          docker run --rm minillm:ci --help
+      - name: Serve the fake engine as the image's user
+        run: |
+          docker run -d --name fake --network host --no-healthcheck \
+            -v "$PWD/benchmarks:/bench:ro" --entrypoint python minillm:ci /bench/fake_server.py --port 8001
+          for i in $(seq 100); do curl -sf localhost:8001/health && break; sleep 0.3; done
+          curl -sf localhost:8001/v1/completions -H 'content-type: application/json' \
+            -d '{"model": "fake", "prompt": "hello", "max_tokens": 16, "ignore_eos": true}' | tee out.json
+          python3 -c "import json; r=json.load(open('out.json')); assert r['usage']['completion_tokens'] == 16, r"
+          curl -sfN localhost:8001/v1/chat/completions -H 'content-type: application/json' \
+            -d '{"model": "fake", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 8, "stream": true}' \
+            | tee stream.txt
+          grep -q '^data: \[DONE\]' stream.txt
+      - name: Fake server logs
+        if: always()
+        run: docker logs fake && docker rm -f fake || true
+      - name: CPU test suite against the installed package
+        # Tests and pytest settings are mounted; minillm is imported from the image.
+        run: |
+          docker run --rm --user root --no-healthcheck -w /work \
+            -v "$PWD/tests:/work/tests:ro" -v "$PWD/pyproject.toml:/work/pyproject.toml:ro" \
+            --entrypoint sh minillm:ci -c '
+              pip --python /opt/venv/bin/python install -q --root-user-action=ignore \
+                "pytest>=8" "pytest-asyncio>=0.23" "hypothesis>=6.100" "httpx>=0.27" &&
+              python -m pytest -q -p no:cacheprovider --durations=5'

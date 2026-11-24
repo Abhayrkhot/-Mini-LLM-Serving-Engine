@@ -1,0 +1,9 @@
+# The image needs only the package and its metadata; everything else stays out
+# of the build context. CI mounts tests/ and benchmarks/ into the container instead.
+*
+!pyproject.toml
+!README.md
+!LICENSE
+!minillm/
+**/__pycache__
+**/*.pyc
