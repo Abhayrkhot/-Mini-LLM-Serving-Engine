@@ -402,3 +402,93 @@ def test_speculative_decoding_is_as_accurate_as_reference_backend(tiny_qwen2_hd6
         accepted += engine.scheduler.spec_accepted
     assert accepted > 0
     assert scores["flashinfer"] >= scores["torch"] - 0.02, scores
+
+
+def _w4a16_ok() -> bool:
+    try:
+        import minillm.quant.w4a16  # noqa: F401  (needs Triton)
+    except Exception:
+        return False
+    return torch.cuda.is_available()
+
+
+@pytest.mark.skipif(not _w4a16_ok(), reason="needs CUDA and Triton")
+@pytest.mark.parametrize("m", [1, 5, 16, 32, 64, 200])
+@pytest.mark.parametrize(("k", "n"), [(896, 1152), (4864, 896), (3584, 4608)])
+def test_w4a16_kernel_matches_dequantized_matmul(m: int, k: int, n: int) -> None:
+    from minillm.quant import dequantize, quantize_rtn
+    from minillm.quant.w4a16 import pack_for_kernel, w4a16_matmul
+
+    torch.manual_seed(m * 7 + k)
+    w = (torch.randn(n, k, device="cuda") * 0.02).to(torch.bfloat16)
+    codes, scale, zero = quantize_rtn(w, 128)
+    qweight, scales, qzeros = pack_for_kernel(codes, scale, zero, torch.bfloat16)
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    ref = x.float() @ dequantize(codes, scales.t().float(), zero).t()
+    out = w4a16_matmul(x, qweight, scales, qzeros, 128)
+    torch.testing.assert_close(out.float(), ref, rtol=2e-2, atol=2e-2 * ref.abs().max().item())
+
+
+@pytest.mark.skipif(not _w4a16_ok(), reason="needs CUDA and Triton")
+def test_w4a16_engine_matches_its_dequantized_model(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """The kernel path is judged against the model it implements: an fp32 copy whose
+    projections hold the same 4-bit weights, with the scales rounded to bf16 as the
+    kernel stores them (a rounded scale is shared by its whole group of 128 weights,
+    so leaving it exact would make the reference a different model). The 4-bit
+    engine must pick that model's argmax as often as the torch backend does on the
+    dequantized weights in bf16. (What 4 bits cost against the original weights is
+    a separate question, measured on real checkpoints.)
+
+    Unlike the other engine tests' model (initialised at 10x the usual scale), this
+    one starts at 0.05: on the former, any change of GEMM implementation is blown
+    up through attention (0.6% after the first projection, 12% by layer 2), even
+    one exactly as precise as cuBLAS against fp32, as this kernel measures."""
+    from transformers import Qwen2Config, Qwen2ForCausalLM
+
+    from minillm.quant import dequantize, quantize_rtn
+
+    torch.manual_seed(0)
+    config = Qwen2Config(
+        vocab_size=512,
+        hidden_size=256,
+        intermediate_size=512,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        max_position_embeddings=1024,
+        initializer_range=0.05,
+        tie_word_embeddings=True,
+    )
+    original = tmp_path_factory.mktemp("qwen2-w4-orig")
+    Qwen2ForCausalLM(config).save_pretrained(original)
+    hf = Qwen2ForCausalLM.from_pretrained(original, dtype=torch.float32)
+    with torch.no_grad():
+        for name, mod in hf.named_modules():
+            if isinstance(mod, torch.nn.Linear) and name.rsplit(".", 1)[-1].endswith("_proj"):
+                codes, scale, zero = quantize_rtn(mod.weight.data.to(torch.bfloat16), 128)
+                scale = scale.to(torch.bfloat16).float()
+                mod.weight.data = dequantize(codes, scale, zero).to(mod.weight.dtype)
+    fake = tmp_path_factory.mktemp("qwen2-w4") / "model"
+    hf.save_pretrained(fake)
+    hf = hf.to("cuda")
+    prompts = [[(7 * i + j) % 500 + 3 for j in range(10 + 19 * i)] for i in range(16)]
+    scores = {}
+    for label, model, kwargs in (
+        ("w4a16", str(original), {"quantization": "w4a16", "attention_backend": "flashinfer"}),
+        ("torch", str(fake), {"attention_backend": "torch"}),
+    ):
+        engine = LLMEngine(
+            EngineConfig(
+                model=model,
+                device="cuda",
+                dtype="bfloat16",
+                max_model_len=512,
+                num_kv_blocks=1024 // 16,
+                max_num_batched_tokens=96,
+                **kwargs,  # type: ignore[arg-type]
+            )
+        )
+        scores[label] = _teacher_forced_agreement(engine, hf, prompts)
+    assert scores["w4a16"] >= scores["torch"] - 0.02, scores

@@ -23,6 +23,7 @@ variant_flags() {  # flags for a minillm variant label
   case $1 in
     minillm-sync) echo --no-async-scheduling ;;
     minillm-unfused) echo --no-fused-kernels ;;
+    minillm-w4a16) echo --quantization w4a16 ;;
     minillm-1proc) echo --no-engine-process ;;
   esac
 }

@@ -39,6 +39,11 @@ class EngineConfig:
 
     enforce_eager: bool = False
     """Disable decode CUDA graphs (used with the flashinfer backend on CUDA)."""
+    quantization: str | None = None
+    """``w4a16``: quantize the decoder projections to 4-bit weights at load time
+    (round-to-nearest, per output row and group of input columns) and run them
+    with a Triton W4A16 kernel. CUDA only."""
+    quant_group_size: int = 128
     fused_kernels: bool = True
     """With the flashinfer backend, run RMSNorm (with the residual add), rotary
     embeddings and SiLU-and-mul as FlashInfer's fused kernels instead of PyTorch ops."""
@@ -62,5 +67,7 @@ class EngineConfig:
             raise ValueError("max_num_seqs and max_num_batched_tokens must be >= 1")
         if self.block_size is not None and self.block_size < 1:
             raise ValueError("block_size must be >= 1")
+        if self.quantization not in (None, "w4a16"):
+            raise ValueError("quantization must be None or w4a16")
         if self.attention_backend not in ("auto", "torch", "flash_attn", "flashinfer"):
             raise ValueError("attention_backend must be auto, torch, flash_attn or flashinfer")
