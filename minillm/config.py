@@ -42,6 +42,13 @@ class EngineConfig:
     fused_kernels: bool = True
     """With the flashinfer backend, run RMSNorm (with the residual add), rotary
     embeddings and SiLU-and-mul as FlashInfer's fused kernels instead of PyTorch ops."""
+    speculative_tokens: int = 0
+    """Speculative decoding: draft up to this many tokens per decoding sequence by
+    n-gram lookup in its own context, and verify them all in one step. Greedy
+    requests only (others decode normally); outputs are unchanged. Turns async
+    scheduling off, since a step's token count is not known until it finishes."""
+    speculative_ngram_max: int = 3
+    """Longest n-gram matched when drafting."""
     async_scheduling: bool = True
     """Schedule and launch step n+1 while the GPU runs step n. A request that stops on
     EOS or a stop token then costs one discarded extra token of compute."""

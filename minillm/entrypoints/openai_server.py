@@ -372,6 +372,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="run norms, rotary embeddings and SiLU as PyTorch ops, not FlashInfer's fused kernels",
     )
     p.add_argument(
+        "--speculative-tokens",
+        type=int,
+        default=0,
+        help="draft up to N tokens per step by n-gram lookup and verify them in one step "
+        "(greedy requests; turns async scheduling off)",
+    )
+    p.add_argument("--speculative-ngram-max", type=int, default=3)
+    p.add_argument(
         "--no-async-scheduling",
         dest="async_scheduling",
         action="store_false",
@@ -412,6 +420,8 @@ def main(argv: list[str] | None = None) -> None:
         num_kv_blocks=args.num_kv_blocks,
         enforce_eager=args.enforce_eager,
         fused_kernels=args.fused_kernels,
+        speculative_tokens=args.speculative_tokens,
+        speculative_ngram_max=args.speculative_ngram_max,
         async_scheduling=args.async_scheduling,
         seed=args.seed,
     )

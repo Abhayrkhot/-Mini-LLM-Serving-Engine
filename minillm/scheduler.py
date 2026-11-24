@@ -31,6 +31,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 
 from minillm.block_manager import BlockManager
+from minillm.ngram import NgramProposer
 from minillm.sequence import FinishReason, Sequence, SequenceStatus
 
 
@@ -38,6 +39,9 @@ from minillm.sequence import FinishReason, Sequence, SequenceStatus
 class ScheduledSeq:
     seq: Sequence
     num_new_tokens: int
+    # Speculative decoding: guessed next tokens, appended to this step's inputs.
+    # The model's token at each of the last 1 + len(drafts) positions comes back.
+    drafts: list[int] = field(default_factory=list)
     # First position this step computes. Fixed at scheduling time: the
     # sequence's own counters move on before the step's results come back.
     start: int = field(init=False)
@@ -47,7 +51,12 @@ class ScheduledSeq:
 
     def __post_init__(self) -> None:
         self.start = self.seq.num_computed_tokens
-        self.sample = self.start + self.num_new_tokens == self.seq.num_tokens
+        computed = self.start + self.num_new_tokens - len(self.drafts)
+        self.sample = computed == self.seq.num_tokens
+
+    @property
+    def num_samples(self) -> int:
+        return 1 + len(self.drafts) if self.sample else 0
 
 
 @dataclass
@@ -81,6 +90,7 @@ class Scheduler:
         max_model_len: int,
         enable_chunked_prefill: bool = True,
         eos_token_ids: Iterable[int] = (),
+        proposer: NgramProposer | None = None,
     ) -> None:
         if max_num_seqs < 1:
             raise ValueError("max_num_seqs must be >= 1")
@@ -97,6 +107,9 @@ class Scheduler:
         self.max_model_len = max_model_len
         self.enable_chunked_prefill = enable_chunked_prefill
         self.eos_token_ids = frozenset(eos_token_ids)
+        self.proposer = proposer
+        self.spec_drafted = 0  # cumulative draft tokens proposed, and accepted
+        self.spec_accepted = 0
         self.waiting: deque[Sequence] = deque()
         self.running: list[Sequence] = []
         self.num_preemptions = 0
@@ -137,6 +150,13 @@ class Scheduler:
                 i += 1
                 continue
             n = min(seq.num_tokens - seq.num_computed_tokens, budget)
+            if n == 1 and self.proposer is not None and seq.params.greedy:
+                drafts = self._draft(seq, budget)
+                if drafts and bm.try_allocate(seq, 1 + len(drafts)):
+                    scheduled.append(self._commit(seq, 1 + len(drafts), drafts))
+                    budget -= 1 + len(drafts)
+                    i += 1
+                    continue
             while not bm.try_allocate(seq, n):
                 victim = self.running.pop()
                 self._preempt(victim)
@@ -175,10 +195,22 @@ class Scheduler:
 
         return SchedulerOutput(scheduled, preempted)
 
+    def _draft(self, seq: Sequence, budget: int) -> list[int]:
+        """Draft tokens for a decoding sequence, never past its length limits."""
+        assert self.proposer is not None
+        limit = min(
+            budget - 1,
+            seq.params.max_tokens - seq.num_output_tokens - 1,
+            self.max_model_len - seq.num_tokens - 1,
+        )
+        return self.proposer.propose(seq, limit) if limit > 0 else []
+
     @staticmethod
-    def _commit(seq: Sequence, num_new_tokens: int) -> ScheduledSeq:
+    def _commit(
+        seq: Sequence, num_new_tokens: int, drafts: list[int] | None = None
+    ) -> ScheduledSeq:
         """Record the step's work on the sequence before it runs."""
-        item = ScheduledSeq(seq, num_new_tokens)
+        item = ScheduledSeq(seq, num_new_tokens, drafts or [])
         seq.num_computed_tokens += num_new_tokens
         if item.sample:
             seq.num_pending_tokens += 1
@@ -193,7 +225,7 @@ class Scheduler:
 
     def update(self, output: SchedulerOutput, sampled: list[int]) -> list[TokenEvent]:
         """Apply a finished step: append its sampled tokens and check stop conditions."""
-        num_samples = sum(1 for s in output.scheduled if s.sample)
+        num_samples = sum(s.num_samples for s in output.scheduled)
         if len(sampled) != num_samples:
             raise ValueError(f"expected {num_samples} sampled tokens, got {len(sampled)}")
         now = time.monotonic()
@@ -208,6 +240,14 @@ class Scheduler:
             if not s.sample:
                 if seq.status is running and caching:
                     bm.cache_full_blocks(seq)
+                continue
+            if s.drafts:
+                targets = [next(tokens) for _ in range(1 + len(s.drafts))]
+                seq.num_pending_tokens -= 1
+                if seq.status is finished:
+                    continue
+                if self._apply_drafts(s, targets, now, events):
+                    any_finished = True
                 continue
             token = next(tokens)
             seq.num_pending_tokens -= 1
@@ -236,6 +276,36 @@ class Scheduler:
             self.running = [s for s in self.running if not s.is_finished]
         return events
 
+    def _apply_drafts(
+        self, s: ScheduledSeq, targets: list[int], now: float, events: list[TokenEvent]
+    ) -> bool:
+        """Accept the drafts the model agrees with, plus the model's next token.
+
+        ``targets[j]`` is the model's greedy token after the inputs up to draft
+        ``j``. Drafts are accepted while they equal it; the first disagreement
+        is replaced by the model's token, and if all agree its token after the
+        last draft comes free. Positions holding rejected drafts stop counting
+        as computed: their K/V is simply overwritten later. Returns True if the
+        sequence finished.
+        """
+        seq, drafts = s.seq, s.drafts
+        accepted = 0
+        while accepted < len(drafts) and drafts[accepted] == targets[accepted]:
+            accepted += 1
+        self.spec_drafted += len(drafts)
+        self.spec_accepted += accepted
+        seq.num_computed_tokens -= len(drafts) - accepted
+        for token in [*drafts[:accepted], targets[accepted]]:
+            gap = seq.append_token(token, now)
+            events.append(TokenEvent(seq, token, gap))
+            reason = self._stop_reason(seq)
+            if reason is not None:
+                self._finish(seq, reason, now)
+                return True
+        if self.block_manager.enable_prefix_caching:
+            self.block_manager.cache_full_blocks(seq)
+        return False
+
     def _stop_reason(self, seq: Sequence) -> FinishReason | None:
         params = seq.params
         token = seq.last_token_id
@@ -255,6 +325,8 @@ class Scheduler:
         self.waiting.appendleft(seq)
 
     def _finish(self, seq: Sequence, reason: FinishReason, now: float) -> None:
+        if self.proposer is not None:
+            self.proposer.forget(seq)
         self.block_manager.free(seq)
         seq.status = SequenceStatus.FINISHED
         seq.finish_reason = reason

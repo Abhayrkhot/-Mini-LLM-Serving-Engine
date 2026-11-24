@@ -68,6 +68,7 @@ def run_minillm(args: argparse.Namespace) -> tuple[float, int, dict[str, Any]]:
             max_model_len=_max_len(args),
             enforce_eager=args.enforce_eager,
             fused_kernels=args.fused_kernels,
+            speculative_tokens=args.speculative_tokens,
             async_scheduling=args.async_scheduling,
         )
     )
@@ -200,6 +201,7 @@ def main() -> None:
         action="store_false",
         help="minillm: PyTorch ops instead of FlashInfer's fused norm/rotary/SiLU kernels",
     )
+    p.add_argument("--speculative-tokens", type=int, default=0, help="minillm: n-gram drafts")
     p.add_argument(
         "--no-async-scheduling",
         dest="async_scheduling",

@@ -13,6 +13,7 @@ from minillm.block_manager import BlockManager
 from minillm.config import EngineConfig
 from minillm.executor.base import Executor, StepHandle
 from minillm.metrics import EngineMetrics, EngineStats, FinishedRequest
+from minillm.ngram import NgramProposer
 from minillm.sampling import SamplingParams
 from minillm.scheduler import Scheduler, SchedulerOutput, TokenEvent
 from minillm.sequence import Sequence
@@ -93,6 +94,9 @@ class LLMEngine:
         )
         if executor.num_kv_blocks * executor.block_size < self.max_model_len:
             raise ValueError("KV cache cannot hold a single max_model_len sequence")
+        proposer = None
+        if config.speculative_tokens > 0:
+            proposer = NgramProposer(config.speculative_tokens, config.speculative_ngram_max)
         self.scheduler = Scheduler(
             self.block_manager,
             max_num_seqs=config.max_num_seqs,
@@ -100,8 +104,13 @@ class LLMEngine:
             max_model_len=self.max_model_len,
             enable_chunked_prefill=config.enable_chunked_prefill,
             eos_token_ids=self.eos_token_ids,
+            proposer=proposer,
         )
-        self.async_scheduling = config.async_scheduling
+        # A speculative step's token count is known only when it finishes, so the
+        # next step cannot be planned ahead of it.
+        self.async_scheduling = config.async_scheduling and proposer is None
+        if proposer is not None and config.async_scheduling:
+            logger.info("Speculative decoding is on: async scheduling is off")
         self._inflight: _Step | None = None
         self._last_ready = 0.0
         self._requests: dict[str, Sequence] = {}
@@ -111,6 +120,7 @@ class LLMEngine:
         self._window_prompt = 0
         self._window_generated = 0
         self._prefix_seen = (0, 0)
+        self._spec_seen = (0, 0)
 
     # ------------------------------------------------------------------ requests
 
@@ -290,6 +300,10 @@ class LLMEngine:
         st.prefix_cache_queries += queries - self._prefix_seen[0]
         st.prefix_cache_hits += hits - self._prefix_seen[1]
         self._prefix_seen = (queries, hits)
+        sched = self.scheduler
+        st.spec_draft_tokens += sched.spec_drafted - self._spec_seen[0]
+        st.spec_accepted_tokens += sched.spec_accepted - self._spec_seen[1]
+        self._spec_seen = (sched.spec_drafted, sched.spec_accepted)
         for ev in events:
             if ev.inter_token_latency is None:
                 seq = ev.seq
@@ -337,6 +351,13 @@ class LLMEngine:
             100 * hit_rate,
             self.scheduler.num_preemptions,
         )
+        sched = self.scheduler
+        if sched.spec_drafted:
+            logger.info(
+                "speculation: %.1f%% of %d drafted tokens accepted",
+                100 * sched.spec_accepted / sched.spec_drafted,
+                sched.spec_drafted,
+            )
         self._last_log = now
         self._window_prompt = 0
         self._window_generated = 0
