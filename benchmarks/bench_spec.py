@@ -176,6 +176,7 @@ def main() -> None:
     ps = prompts(tokenizer, args)
     rows = run_minillm(args, ps) if args.engine == "minillm" else run_vllm(args, ps)
     if args.output:
+        os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
         with open(args.output, "w") as f:
             json.dump({"model": args.model, "args": vars(args), "rows": rows}, f, indent=2)
 
