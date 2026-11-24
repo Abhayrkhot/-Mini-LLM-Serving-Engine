@@ -179,3 +179,38 @@ class _view:  # what next_token sees for a bare prompt
     def __init__(self, tokens: list[int]) -> None:
         self.token_ids = tokens
         self.num_prompt_tokens = len(tokens)
+
+
+def test_async_does_not_plan_past_a_long_step() -> None:
+    """Once steps with prompt chunks are known to be slow, the engine collects such a
+    step before planning the next, so requests arriving meanwhile make the next step."""
+    from minillm.executor.fake import LinearCost
+
+    executor = FakeExecutor(
+        num_kv_blocks=1024,
+        block_size=4,
+        max_model_len=1024,
+        vocab_size=40,
+        cost_model=LinearCost(0.001, 30e-6, 0.0),  # 30 us per token: 900 tokens ~ 28 ms
+        next_token=next_token,
+    )
+    engine = LLMEngine(EngineConfig(model="fake", max_num_batched_tokens=1024), executor=executor)
+    params = SamplingParams(max_tokens=3, ignore_eos=True)
+    engine.add_request([5] * 900, params, "warm")  # one long step teaches the rate
+    while engine.has_unfinished_requests():
+        engine.step()
+    assert engine._prefill_s_per_token is not None
+
+    engine.add_request([6] * 900, params, "long")  # ~28 ms: long
+    engine.step()  # launches it
+    assert engine._inflight is not None
+    launched = len(executor.history)
+    out = engine.step()  # collects it without launching anything new
+    assert [o.request_id for o in out] == ["long"]
+    assert len(executor.history) == launched and engine._inflight is None
+
+    engine.add_request([7] * 3, params, "short")  # a short step still runs ahead
+    engine.step()
+    assert engine._inflight is not None
+    engine.step()
+    assert engine._inflight is not None
